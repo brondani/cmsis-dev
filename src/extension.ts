@@ -1,8 +1,18 @@
 import * as cp from "node:child_process";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { ActionsProvider } from "./actionsProvider";
-import { RunsProvider } from "./runsProvider";
+import {
+  CodexReasoningEffort,
+  describeCodexSettings,
+  getConfiguredCodexModel,
+  getConfiguredCodexReasoningEffort,
+  getPreferredSettingsTarget,
+  listCodexModelCandidates,
+  listCodexReasoningEffortCandidates
+} from "./codexSettings";
+import { getRelatedRunFilePaths, RunOutputItem, RunsProvider } from "./runsProvider";
 import { clearGitHubToken, initializeSecretStorage, setGitHubToken } from "./secrets";
 import { WorkflowDefinition } from "./types";
 import { createWorkflowDiagnosticCollection, refreshWorkflowDiagnostics, validateWorkflowTextDocument } from "./workflowDiagnostics";
@@ -11,7 +21,7 @@ import {
   DEFAULT_WORKFLOW_CONFIG_PATH,
   getConfiguredWorkflowConfigPath,
   initializeWorkflowConfig,
-  resolveWorkflowConfigUri,
+  resolveWorkspaceWorkflowConfigUri,
   resolveWorkflowRunsDirUri
 } from "./workflowConfig";
 import {
@@ -31,7 +41,14 @@ let mcpProcess: cp.ChildProcess | undefined;
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   initializeSecretStorage(context.secrets);
   const provider = new ActionsProvider();
+  const actionsTreeView = vscode.window.createTreeView("cmsisDev.actions", {
+    treeDataProvider: provider
+  });
   const runsProvider = new RunsProvider();
+  const runsTreeView = vscode.window.createTreeView("cmsisDev.runs", {
+    treeDataProvider: runsProvider,
+    canSelectMany: true
+  });
   const workflowsProvider = new WorkflowsProvider();
   const workflowDiagnostics = createWorkflowDiagnosticCollection();
   const workflowWatchers = createWorkflowWatchers(getConfiguredWorkflowConfigPath());
@@ -71,9 +88,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.window.onDidChangeActiveTextEditor((editor) => {
       void updateActiveOutputContexts(editor);
     }),
-    vscode.window.registerTreeDataProvider("cmsisDev.actions", provider),
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration("cmsisDev.codexModel") || event.affectsConfiguration("cmsisDev.codexReasoningEffort")) {
+        void updateActionsViewDescription(actionsTreeView);
+      }
+    }),
+    actionsTreeView,
     vscode.window.registerTreeDataProvider("cmsisDev.workflows", workflowsProvider),
-    vscode.window.registerTreeDataProvider("cmsisDev.runs", runsProvider),
+    runsTreeView,
     vscode.commands.registerCommand("cmsisDev.initializeWorkflows", async () => {
       await initializeWorkflowConfig();
       await provider.refresh();
@@ -91,8 +113,78 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("cmsisDev.refreshRuns", async () => {
       await runsProvider.refresh();
     }),
+    vscode.commands.registerCommand(
+      "cmsisDev.deleteRuns",
+      async (item?: unknown, selectedItems?: readonly unknown[]) => {
+        const targets = resolveRunDeletionTargets(item, selectedItems, runsTreeView.selection);
+        if (targets.length === 0) {
+          vscode.window.showWarningMessage("No run outputs selected for deletion.");
+          return;
+        }
+
+        const detailLines = targets.slice(0, 8).map((target) => path.basename(target.uri.fsPath));
+        if (targets.length > detailLines.length) {
+          detailLines.push(`...and ${targets.length - detailLines.length} more`);
+        }
+
+        const confirmation = await vscode.window.showWarningMessage(
+          targets.length === 1
+            ? `Delete run output '${path.basename(targets[0].uri.fsPath)}' and its related files?`
+            : `Delete ${targets.length} run outputs and their related files?`,
+          {
+            modal: true,
+            detail: [
+              "This removes the output file, its reasoning file, and its metadata file from disk.",
+              ...detailLines
+            ].join("\n")
+          },
+          "Delete"
+        );
+        if (confirmation !== "Delete") {
+          return;
+        }
+
+        let deletedRuns = 0;
+        const failedFiles: string[] = [];
+        for (const target of targets) {
+          let deletedAnyForRun = false;
+          for (const relatedPath of getRelatedRunFilePaths(target.uri.fsPath)) {
+            try {
+              await fs.rm(relatedPath, { force: true });
+              deletedAnyForRun = true;
+            } catch {
+              failedFiles.push(relatedPath);
+            }
+          }
+
+          if (deletedAnyForRun) {
+            deletedRuns += 1;
+          }
+        }
+
+        await runsProvider.refresh();
+        await updateActiveOutputContexts(vscode.window.activeTextEditor);
+
+        if (failedFiles.length > 0) {
+          vscode.window.showWarningMessage(
+            `Deleted ${deletedRuns} run ${deletedRuns === 1 ? "output" : "outputs"}, but some related files could not be removed.`
+          );
+          return;
+        }
+
+        vscode.window.showInformationMessage(
+          `Deleted ${deletedRuns} run ${deletedRuns === 1 ? "output" : "outputs"} and related files.`
+        );
+      }
+    ),
     vscode.commands.registerCommand("cmsisDev.refreshWorkflows", async () => {
       await workflowsProvider.refresh();
+    }),
+    vscode.commands.registerCommand("cmsisDev.selectCodexModel", async () => {
+      await selectCodexModel(actionsTreeView);
+    }),
+    vscode.commands.registerCommand("cmsisDev.selectCodexReasoningEffort", async () => {
+      await selectCodexReasoningEffort(actionsTreeView);
     }),
     vscode.commands.registerCommand("cmsisDev.setGitHubToken", async () => {
       const token = await vscode.window.showInputBox({
@@ -135,6 +227,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   await provider.refresh();
+  await updateActionsViewDescription(actionsTreeView);
   await workflowsProvider.refresh();
   await runsProvider.refresh();
   await refreshWorkflowDiagnostics(workflowDiagnostics);
@@ -143,6 +236,41 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
   await updateActiveOutputContexts(vscode.window.activeTextEditor);
   void startMcpServer(context);
+}
+
+function resolveRunDeletionTargets(
+  item: unknown,
+  selectedItems: readonly unknown[] | undefined,
+  currentSelection: readonly unknown[]
+): RunOutputItem[] {
+  const clickedItem = isRunOutputItem(item) ? item : undefined;
+  const candidates =
+    selectedItems && selectedItems.length > 0
+      ? selectedItems
+      : clickedItem && currentSelection.some((selected) => isRunOutputItem(selected) && selected.uri.fsPath === clickedItem.uri.fsPath)
+        ? currentSelection
+        : clickedItem
+          ? [clickedItem]
+          : [...currentSelection];
+
+  const unique = new Map<string, RunOutputItem>();
+  for (const candidate of candidates) {
+    if (!isRunOutputItem(candidate)) {
+      continue;
+    }
+
+    unique.set(candidate.uri.fsPath.toLowerCase(), candidate);
+  }
+
+  return Array.from(unique.values());
+}
+
+function isRunOutputItem(value: unknown): value is RunOutputItem {
+  if (!(value instanceof RunOutputItem)) {
+    return false;
+  }
+
+  return value.uri instanceof vscode.Uri && typeof value.modifiedAt === "number";
 }
 
 export function deactivate(): void {
@@ -155,7 +283,7 @@ async function chooseWorkflow(provider: ActionsProvider): Promise<WorkflowDefini
   await provider.refresh();
   const workflows = provider.getWorkflows();
   if (workflows.length === 0) {
-    vscode.window.showInformationMessage("No workflows found. Run 'CMSIS-Dev: Initialize Workflow Config'.");
+    vscode.window.showInformationMessage("No workflows found. Check the bundled workflow files or create workspace overrides.");
     return undefined;
   }
 
@@ -214,22 +342,147 @@ async function runWorkflowWithStatus(workflow: WorkflowDefinition): Promise<void
   }
 }
 
+async function updateActionsViewDescription(actionsTreeView: vscode.TreeView<unknown>): Promise<void> {
+  actionsTreeView.description = await describeCodexSettings();
+}
+
+async function selectCodexModel(actionsTreeView: vscode.TreeView<unknown>): Promise<void> {
+  const configuredModel = getConfiguredCodexModel();
+  const candidates = await listCodexModelCandidates();
+  const quickPickItems: Array<vscode.QuickPickItem & { model?: string; custom?: boolean }> = [
+    ...candidates.map((model) => ({
+      label: model,
+      description: model === configuredModel ? "Current selection" : undefined,
+      model
+    })),
+    {
+      label: "Custom...",
+      description: configuredModel && !candidates.includes(configuredModel) ? configuredModel : undefined,
+      detail: "Enter a model id manually.",
+      custom: true
+    }
+  ];
+
+  const selected = await vscode.window.showQuickPick(quickPickItems, {
+    title: "Select Codex Model",
+    placeHolder: "Choose the Codex model for CMSIS-Dev actions"
+  });
+  if (!selected) {
+    return;
+  }
+
+  let nextValue: string | undefined;
+  if (selected.custom) {
+    const entered = await vscode.window.showInputBox({
+      title: "Codex Model",
+      prompt: "Enter the Codex model id to use for CMSIS-Dev actions",
+      value: configuredModel ?? "",
+      ignoreFocusOut: true,
+      validateInput: (value) => (value.trim().length > 0 ? null : "Model id cannot be empty")
+    });
+    if (!entered) {
+      return;
+    }
+
+    nextValue = entered.trim();
+  } else {
+    nextValue = selected.model;
+  }
+
+  await vscode.workspace
+    .getConfiguration("cmsisDev")
+    .update("codexModel", nextValue ?? undefined, getPreferredSettingsTarget());
+  await updateActionsViewDescription(actionsTreeView);
+}
+
+async function selectCodexReasoningEffort(actionsTreeView: vscode.TreeView<unknown>): Promise<void> {
+  const configuredReasoning = getConfiguredCodexReasoningEffort();
+  const candidates = await listCodexReasoningEffortCandidates();
+  const quickPickItems: Array<vscode.QuickPickItem & { value?: CodexReasoningEffort; custom?: boolean }> = [
+    ...candidates.map((value) => ({
+      label: formatReasoningEffortLabel(value),
+      description: value === configuredReasoning ? "Current selection" : undefined,
+      detail: describeReasoningEffort(value),
+      value
+    })),
+    {
+      label: "Custom...",
+      detail: "Enter a reasoning effort manually.",
+      custom: true
+    }
+  ];
+
+  const selected = await vscode.window.showQuickPick(quickPickItems, {
+    title: "Select Codex Reasoning Effort",
+    placeHolder: "Choose the reasoning effort for CMSIS-Dev actions"
+  });
+  if (!selected) {
+    return;
+  }
+
+  let nextValue: string | undefined;
+  if (selected.custom) {
+    const entered = await vscode.window.showInputBox({
+      title: "Codex Reasoning Effort",
+      prompt: "Enter the reasoning effort to use for CMSIS-Dev actions",
+      value: configuredReasoning ?? "",
+      ignoreFocusOut: true,
+      validateInput: (value) => (value.trim().length > 0 ? null : "Reasoning effort cannot be empty")
+    });
+    if (!entered) {
+      return;
+    }
+
+    nextValue = entered.trim();
+  } else {
+    nextValue = selected.value;
+  }
+
+  await vscode.workspace
+    .getConfiguration("cmsisDev")
+    .update("codexReasoningEffort", nextValue ?? undefined, getPreferredSettingsTarget());
+  await updateActionsViewDescription(actionsTreeView);
+}
+
+function formatReasoningEffortLabel(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "low" || normalized === "medium" || normalized === "high") {
+    return `${normalized.charAt(0).toUpperCase()}${normalized.slice(1)}`;
+  }
+
+  return value;
+}
+
+function describeReasoningEffort(value: string): string | undefined {
+  const normalized = value.trim().toLowerCase();
+  switch (normalized) {
+    case "low":
+      return "Efficient reasoning with a modest latency increase.";
+    case "medium":
+      return "When quality and reliability matter, and the task involves planning, complex reasoning, and judgement.";
+    case "high":
+      return "Hard reasoning, complex debugging, deep planning, and high-value tasks where quality and intelligence matters more than latency.";
+    case "xhigh":
+      return "Deep research, asynchronous workflows and agentic tasks that require very long rollouts. ";
+    default:
+      return undefined;
+  }
+}
+
 async function startMcpServer(context: vscode.ExtensionContext): Promise<void> {
   const serverScript = path.join(context.extensionPath, "out", "mcp", "server.js");
-  const resolvedWorkflowConfigUri = await resolveWorkflowConfigUri();
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-  const workflowConfigAbsolutePath =
-    resolvedWorkflowConfigUri?.scheme === "file"
-      ? resolvedWorkflowConfigUri.fsPath
-      : workspaceFolder
-        ? path.join(workspaceFolder.uri.fsPath, getConfiguredWorkflowConfigPath())
-        : path.join(context.extensionPath, getConfiguredWorkflowConfigPath());
+  const workspaceWorkflowConfigUri = await resolveWorkspaceWorkflowConfigUri();
+  const runsDirUri = await resolveWorkflowRunsDirUri();
 
   mcpProcess = cp.spawn(process.execPath, [serverScript], {
     cwd: workspaceFolder?.uri.fsPath ?? context.extensionPath,
     env: {
       ...process.env,
-      CMSIS_DEV_WORKFLOW_CONFIG: workflowConfigAbsolutePath
+      CMSIS_DEV_EXTENSION_PATH: context.extensionPath,
+      CMSIS_DEV_WORKSPACE_WORKFLOW_CONFIG:
+        workspaceWorkflowConfigUri?.scheme === "file" ? workspaceWorkflowConfigUri.fsPath : "",
+      CMSIS_DEV_WORKFLOW_RUNS_DIR: runsDirUri?.scheme === "file" ? runsDirUri.fsPath : ""
     },
     stdio: "pipe",
     windowsHide: true

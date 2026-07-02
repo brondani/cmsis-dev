@@ -19,6 +19,9 @@
     "onCommand:cmsisDev.initializeWorkflows",
     "onCommand:cmsisDev.refreshWorkflows",
     "onCommand:cmsisDev.refreshRuns",
+    "onCommand:cmsisDev.deleteRuns",
+    "onCommand:cmsisDev.selectCodexModel",
+    "onCommand:cmsisDev.selectCodexReasoningEffort",
     "onCommand:cmsisDev.setGitHubToken",
     "onCommand:cmsisDev.clearGitHubToken",
     "onCommand:cmsisDev.openReasoningForActiveOutput",
@@ -30,6 +33,15 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cmsisDev",
+          "title": "CMSIS-Dev",
+          "icon": "media/cmsis-dev.svg"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "cmsisDev.runAction",
@@ -37,12 +49,27 @@
       },
       {
         "command": "cmsisDev.initializeWorkflows",
-        "title": "CMSIS-Dev: Initialize Workflow Config"
+        "title": "CMSIS-Dev: Create Workflow Overrides"
+      },
+      {
+        "command": "cmsisDev.selectCodexModel",
+        "title": "CMSIS-Dev: Set Codex Model",
+        "icon": "$(hubot)"
+      },
+      {
+        "command": "cmsisDev.selectCodexReasoningEffort",
+        "title": "CMSIS-Dev: Set Codex Reasoning",
+        "icon": "$(pulse)"
       },
       {
         "command": "cmsisDev.refreshRuns",
         "title": "CMSIS-Dev: Refresh Runs",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "cmsisDev.deleteRuns",
+        "title": "CMSIS-Dev: Delete Runs",
+        "icon": "$(trash)"
       },
       {
         "command": "cmsisDev.refreshWorkflows",
@@ -89,26 +116,37 @@
       }
     ],
     "views": {
-      "explorer": [
+      "cmsisDev": [
         {
           "id": "cmsisDev.actions",
-          "name": "CMSIS-Dev Actions"
-        },
-        {
-          "id": "cmsisDev.workflows",
-          "name": "CMSIS-Dev Workflows"
+          "name": "Actions"
         },
         {
           "id": "cmsisDev.runs",
-          "name": "CMSIS-Dev Runs"
+          "name": "Runs"
+        },
+        {
+          "id": "cmsisDev.workflows",
+          "name": "Workflows",
+          "visibility": "collapsed"
         }
       ]
     },
     "menus": {
       "view/title": [
         {
-          "command": "cmsisDev.initializeWorkflows",
+          "command": "cmsisDev.selectCodexModel",
           "when": "view == cmsisDev.actions",
+          "group": "navigation"
+        },
+        {
+          "command": "cmsisDev.selectCodexReasoningEffort",
+          "when": "view == cmsisDev.actions",
+          "group": "navigation"
+        },
+        {
+          "command": "cmsisDev.initializeWorkflows",
+          "when": "view == cmsisDev.workflows",
           "group": "navigation"
         },
         {
@@ -120,6 +158,18 @@
           "command": "cmsisDev.refreshRuns",
           "when": "view == cmsisDev.runs",
           "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "cmsisDev.deleteRuns",
+          "when": "view == cmsisDev.runs && viewItem == cmsisDev.runOutput",
+          "group": "inline"
+        },
+        {
+          "command": "cmsisDev.deleteRuns",
+          "when": "view == cmsisDev.runs && viewItem == cmsisDev.runOutput",
+          "group": "2_cmsisDev@1"
         }
       ],
       "editor/title": [
@@ -195,25 +245,15 @@
           "default": ".cmsis-dev/workflows",
           "description": "Relative path to the workflow configuration file or directory."
         },
-        "cmsisDev.autoOpenChat": {
-          "type": "boolean",
-          "default": true,
-          "description": "Attempt to open the Copilot Chat view with the generated review prompt."
-        },
-        "cmsisDev.reviewEngine": {
+        "cmsisDev.codexModel": {
           "type": "string",
-          "enum": [
-            "ask",
-            "copilot",
-            "codex"
-          ],
-          "default": "codex",
-          "description": "AI engine used for Review PR. Choose ask to prompt each run."
+          "default": "",
+          "description": "Optional Codex model override for CMSIS-Dev actions. Leave empty to inherit the model from ~/.codex/config.toml or the Codex default."
         },
-        "cmsisDev.codexModelPattern": {
+        "cmsisDev.codexReasoningEffort": {
           "type": "string",
-          "default": "codex|gpt-5",
-          "description": "Regex used to identify Codex-capable chat models when reviewEngine is codex."
+          "default": "",
+          "description": "Optional reasoning effort override for CMSIS-Dev actions. Leave empty to inherit the value from ~/.codex/config.toml or the CMSIS-Dev fallback."
         }
       }
     }

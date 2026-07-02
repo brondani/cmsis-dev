@@ -3,7 +3,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { resolveWorkflowRunsDirUri } from "./workflowConfig";
 
-class RunOutputItem extends vscode.TreeItem {
+export class RunOutputItem extends vscode.TreeItem {
   readonly modifiedAt: number;
 
   constructor(
@@ -19,7 +19,7 @@ class RunOutputItem extends vscode.TreeItem {
     this.command = {
       command: "vscode.open",
       title: "Open Run Output",
-      arguments: [uri, { preview: false }]
+      arguments: [uri, { preview: true }]
     };
   }
 }
@@ -31,6 +31,10 @@ class RunsPlaceholderItem extends vscode.TreeItem {
 }
 
 type RunsTreeItem = RunOutputItem | RunsPlaceholderItem;
+
+export function getRelatedRunFilePaths(outputPath: string): string[] {
+  return [outputPath, `${outputPath}.reasoning.md`, `${outputPath}.meta.json`];
+}
 
 export class RunsProvider implements vscode.TreeDataProvider<RunsTreeItem> {
   private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<RunsTreeItem | undefined | null | void>();

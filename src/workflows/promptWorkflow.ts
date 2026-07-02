@@ -4,6 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import {
+  resolveEffectiveCodexModel,
+  resolveEffectiveCodexReasoningEffort
+} from "../codexSettings";
+import {
   createPullRequest,
   getIssue,
   getIssueComments,
@@ -13,8 +17,7 @@ import {
   listOpenIssues,
   listOpenPullRequests,
   postPullRequestComment,
-  resolveGitReposFromWorkspace,
-  resolveReposFromWorkspace
+  resolveGitReposFromWorkspace
 } from "../github";
 import { getGitHubToken } from "../secrets";
 import {
@@ -28,7 +31,7 @@ import {
 } from "../types";
 import { resolveWorkflowRunsDirUri } from "../workflowConfig";
 
-type ReviewEngine = "copilot" | "codex";
+type ReviewEngine = "codex";
 
 export interface PromptWorkflowOptions {
   onStatus?: (status: string) => void;
@@ -51,12 +54,16 @@ interface SelectedPrContext {
   owner: string;
   repo: string;
   pr: PullRequestSummary;
+  rootPath?: string;
+  workspaceFolderName?: string;
 }
 
 interface SelectedIssueContext {
   owner: string;
   repo: string;
   issue: IssueSummary;
+  rootPath?: string;
+  workspaceFolderName?: string;
 }
 
 interface SelectedLocalChangesContext {
@@ -169,14 +176,7 @@ export async function runPromptWorkflow(
   const openCodexChatPrompt = workflow.openCodexChatPromptTemplate?.trim()
     ? renderPromptTemplate(workflow.openCodexChatPromptTemplate, resolved.values)
     : undefined;
-  const engine = await resolveEngine();
-  if (!engine) {
-    return {
-      generated: false,
-      handedOffToCodexChat: false,
-      canceled: true
-    };
-  }
+  const engine: ReviewEngine = "codex";
   const followUps = resolveWorkflowFollowUps(workflow);
   let pullRequestDraft: PullRequestDraft | undefined;
 
@@ -201,22 +201,17 @@ export async function runPromptWorkflow(
   };
   await updateReasoningFile(liveReasoningFile, liveReasoningPayload);
 
-  reportStatus(`Generating ${workflow.title} with ${engine === "codex" ? "Codex" : "Copilot"}`);
-  let generated = await tryGenerateWithLm(prompt, engine);
-
-  if (!generated && engine === "codex") {
-    liveReasoningPayload.phase = "codex-cli";
-    liveReasoningPayload.status = "running";
-    await updateReasoningFile(liveReasoningFile, liveReasoningPayload);
-    reportStatus(`Generating ${workflow.title} with Codex CLI`);
-    generated = await tryGenerateWithCodexCli(prompt, {
-      onStatus: reportStatus,
-      onEvent: async (event) => {
-        liveReasoningPayload.codexCliEvent = event;
-        await updateReasoningFile(liveReasoningFile, liveReasoningPayload);
-      }
-    });
-  }
+  liveReasoningPayload.phase = "codex-cli";
+  liveReasoningPayload.status = "running";
+  await updateReasoningFile(liveReasoningFile, liveReasoningPayload);
+  reportStatus(`Generating ${workflow.title} with Codex CLI`);
+  const generated = await tryGenerateWithCodexCli(prompt, {
+    onStatus: reportStatus,
+    onEvent: async (event) => {
+      liveReasoningPayload.codexCliEvent = event;
+      await updateReasoningFile(liveReasoningFile, liveReasoningPayload);
+    }
+  });
 
   if (!generated) {
     liveReasoningPayload.phase = "failed";
@@ -500,8 +495,9 @@ async function postCommentFromMetadata(metadata: ActionOutputMetadata): Promise<
     return;
   }
 
-  if (!metadata.prContext || !metadata.generatedOutput) {
-    vscode.window.showWarningMessage("This output file does not contain PR context and generated review text for posting.");
+  const commentBody = await resolveOutputFileText(metadata);
+  if (!metadata.prContext || !commentBody?.trim()) {
+    vscode.window.showWarningMessage("This output file does not contain PR context and readable review text for posting.");
     return;
   }
 
@@ -519,7 +515,7 @@ async function postCommentFromMetadata(metadata: ActionOutputMetadata): Promise<
       metadata.prContext.owner,
       metadata.prContext.repo,
       metadata.prContext.pr.number,
-      metadata.generatedOutput,
+      commentBody,
       { token }
     );
     const postedAction = await vscode.window.showInformationMessage("Comment posted to pull request.", "Open Comment");
@@ -539,10 +535,18 @@ async function submitPullRequestFromMetadata(metadata: ActionOutputMetadata): Pr
     return;
   }
 
-  const draft = metadata.pullRequestDraft;
   const context = metadata.localChangesContext;
-  if (!draft || !context?.owner || !context.repo) {
+  if (!context?.owner || !context.repo) {
     vscode.window.showWarningMessage("This output file does not contain enough local repository context to submit a PR.");
+    return;
+  }
+
+  const outputText = await resolveOutputFileText(metadata);
+  const draft = outputText ? parsePullRequestDraftFromOutputFile(outputText) : undefined;
+  if (!draft) {
+    vscode.window.showWarningMessage(
+      "Could not derive a PR title and body from the current output file. Keep the markdown title and body structure intact."
+    );
     return;
   }
 
@@ -673,6 +677,14 @@ async function collectInputValues(workflow: WorkflowDefinition, token?: string):
       values[`${input.id}_prBody`] = selected.pr.body || "(No PR description provided)";
       values[`${input.id}_fileSections`] = fileSections;
       values[`${input.id}_prUrl`] = selected.pr.htmlUrl;
+      if (selected.rootPath) {
+        values[`${input.id}_repoPath`] = selected.rootPath;
+        values.repoPath ??= selected.rootPath;
+      }
+      if (selected.workspaceFolderName) {
+        values[`${input.id}_workspaceFolder`] = selected.workspaceFolderName;
+        values.workspaceFolder ??= selected.workspaceFolderName;
+      }
 
       values.owner ??= selected.owner;
       values.repo ??= selected.repo;
@@ -713,6 +725,14 @@ async function collectInputValues(workflow: WorkflowDefinition, token?: string):
       values[`${input.id}_linkedPrs`] = formatSimpleList(references.linkedPullRequests, "(No linked pull requests found)");
       values[`${input.id}_relatedIssues`] = formatSimpleList(references.relatedIssues, "(No related issues found)");
       values[`${input.id}_url`] = selected.issue.htmlUrl;
+      if (selected.rootPath) {
+        values[`${input.id}_repoPath`] = selected.rootPath;
+        values.repoPath ??= selected.rootPath;
+      }
+      if (selected.workspaceFolderName) {
+        values[`${input.id}_workspaceFolder`] = selected.workspaceFolderName;
+        values.workspaceFolder ??= selected.workspaceFolderName;
+      }
 
       values.owner ??= selected.owner;
       values.repo ??= selected.repo;
@@ -807,10 +827,19 @@ async function selectPrContext(token: string | undefined, input: WorkflowInputDe
     }
 
     const pr = await getPullRequest(parsed.owner, parsed.repo, parsed.number, { token });
-    return { owner: parsed.owner, repo: parsed.repo, pr };
+    const workspaceRepo = await resolveWorkspaceRepoForRemote(parsed.owner, parsed.repo);
+    return {
+      owner: parsed.owner,
+      repo: parsed.repo,
+      pr,
+      rootPath: workspaceRepo?.rootPath,
+      workspaceFolderName: workspaceRepo?.workspaceFolderName
+    };
   }
 
-  const workspaceRepos = await resolveReposFromWorkspace();
+  const workspaceRepos = (await resolveGitReposFromWorkspace()).filter(
+    (repo): repo is { rootPath: string; workspaceFolderName: string; owner: string; repo: string } => Boolean(repo.owner && repo.repo)
+  );
   if (workspaceRepos.length === 0) {
     const manualRepo = await vscode.window.showInputBox({
       title: "Repository",
@@ -848,33 +877,45 @@ async function selectPrContext(token: string | undefined, input: WorkflowInputDe
       return undefined;
     }
 
-    return { owner: repoInfo.owner, repo: repoInfo.repo, pr: selectedPr.pr };
+    const workspaceRepo = await resolveWorkspaceRepoForRemote(repoInfo.owner, repoInfo.repo);
+    return {
+      owner: repoInfo.owner,
+      repo: repoInfo.repo,
+      pr: selectedPr.pr,
+      rootPath: workspaceRepo?.rootPath,
+      workspaceFolderName: workspaceRepo?.workspaceFolderName
+    };
   }
 
-  const uniqueRepos = new Map<string, { owner: string; repo: string; workspaceFolderName: string }>();
+  const uniqueRepos = new Map<string, Array<{ owner: string; repo: string; rootPath: string; workspaceFolderName: string }>>();
   for (const workspaceRepo of workspaceRepos) {
     const key = `${workspaceRepo.owner}/${workspaceRepo.repo}`.toLowerCase();
-    if (!uniqueRepos.has(key)) {
-      uniqueRepos.set(key, workspaceRepo);
-    }
+    const existing = uniqueRepos.get(key) ?? [];
+    existing.push(workspaceRepo);
+    uniqueRepos.set(key, existing);
   }
 
   const repoResults = await Promise.all(
-    Array.from(uniqueRepos.values()).map(async (repoInfo) => {
+    Array.from(uniqueRepos.values()).map(async (repoInfos) => {
+      const [repoInfo] = repoInfos;
       const prs = await listOpenPullRequests(repoInfo.owner, repoInfo.repo, { token });
-      return { repoInfo, prs };
+      return { repoInfos, prs };
     })
   );
 
-  const quickPickItems = repoResults.flatMap(({ repoInfo, prs }) =>
-    prs.map((pr) => ({
-      label: `#${pr.number} ${pr.title}`,
-      description: `${repoInfo.owner}/${repoInfo.repo} (${repoInfo.workspaceFolderName})`,
-      detail: `${pr.headRef} -> ${pr.baseRef} | @${pr.author}`,
-      owner: repoInfo.owner,
-      repo: repoInfo.repo,
-      pr
-    }))
+  const quickPickItems = repoResults.flatMap(({ repoInfos, prs }) =>
+    repoInfos.flatMap((repoInfo) =>
+      prs.map((pr) => ({
+        label: `#${pr.number} ${pr.title}`,
+        description: `${repoInfo.owner}/${repoInfo.repo} (${repoInfo.workspaceFolderName})`,
+        detail: `${pr.headRef} -> ${pr.baseRef} | @${pr.author} | ${repoInfo.rootPath}`,
+        owner: repoInfo.owner,
+        repo: repoInfo.repo,
+        pr,
+        rootPath: repoInfo.rootPath,
+        workspaceFolderName: repoInfo.workspaceFolderName
+      }))
+    )
   );
 
   if (quickPickItems.length === 0) {
@@ -887,7 +928,13 @@ async function selectPrContext(token: string | undefined, input: WorkflowInputDe
     return undefined;
   }
 
-  return { owner: selectedPr.owner, repo: selectedPr.repo, pr: selectedPr.pr };
+  return {
+    owner: selectedPr.owner,
+    repo: selectedPr.repo,
+    pr: selectedPr.pr,
+    rootPath: selectedPr.rootPath,
+    workspaceFolderName: selectedPr.workspaceFolderName
+  };
 }
 
 async function selectIssueContext(token: string | undefined, input: WorkflowInputDefinition): Promise<SelectedIssueContext | undefined> {
@@ -921,10 +968,19 @@ async function selectIssueContext(token: string | undefined, input: WorkflowInpu
     }
 
     const issue = await getIssue(parsed.owner, parsed.repo, parsed.number, { token });
-    return { owner: parsed.owner, repo: parsed.repo, issue };
+    const workspaceRepo = await resolveWorkspaceRepoForRemote(parsed.owner, parsed.repo);
+    return {
+      owner: parsed.owner,
+      repo: parsed.repo,
+      issue,
+      rootPath: workspaceRepo?.rootPath,
+      workspaceFolderName: workspaceRepo?.workspaceFolderName
+    };
   }
 
-  const workspaceRepos = await resolveReposFromWorkspace();
+  const workspaceRepos = (await resolveGitReposFromWorkspace()).filter(
+    (repo): repo is { rootPath: string; workspaceFolderName: string; owner: string; repo: string } => Boolean(repo.owner && repo.repo)
+  );
   if (workspaceRepos.length === 0) {
     const manualRepo = await vscode.window.showInputBox({
       title: "Repository",
@@ -962,33 +1018,45 @@ async function selectIssueContext(token: string | undefined, input: WorkflowInpu
       return undefined;
     }
 
-    return { owner: repoInfo.owner, repo: repoInfo.repo, issue: selectedIssue.issue };
+    const workspaceRepo = await resolveWorkspaceRepoForRemote(repoInfo.owner, repoInfo.repo);
+    return {
+      owner: repoInfo.owner,
+      repo: repoInfo.repo,
+      issue: selectedIssue.issue,
+      rootPath: workspaceRepo?.rootPath,
+      workspaceFolderName: workspaceRepo?.workspaceFolderName
+    };
   }
 
-  const uniqueRepos = new Map<string, { owner: string; repo: string; workspaceFolderName: string }>();
+  const uniqueRepos = new Map<string, Array<{ owner: string; repo: string; rootPath: string; workspaceFolderName: string }>>();
   for (const workspaceRepo of workspaceRepos) {
     const key = `${workspaceRepo.owner}/${workspaceRepo.repo}`.toLowerCase();
-    if (!uniqueRepos.has(key)) {
-      uniqueRepos.set(key, workspaceRepo);
-    }
+    const existing = uniqueRepos.get(key) ?? [];
+    existing.push(workspaceRepo);
+    uniqueRepos.set(key, existing);
   }
 
   const repoResults = await Promise.all(
-    Array.from(uniqueRepos.values()).map(async (repoInfo) => {
+    Array.from(uniqueRepos.values()).map(async (repoInfos) => {
+      const [repoInfo] = repoInfos;
       const issues = await listOpenIssues(repoInfo.owner, repoInfo.repo, { token });
-      return { repoInfo, issues };
+      return { repoInfos, issues };
     })
   );
 
-  const quickPickItems = repoResults.flatMap(({ repoInfo, issues }) =>
-    issues.map((issue) => ({
-      label: `#${issue.number} ${issue.title}`,
-      description: `${repoInfo.owner}/${repoInfo.repo} (${repoInfo.workspaceFolderName})`,
-      detail: `@${issue.author} | state: ${issue.state} | comments: ${issue.commentsCount}`,
-      owner: repoInfo.owner,
-      repo: repoInfo.repo,
-      issue
-    }))
+  const quickPickItems = repoResults.flatMap(({ repoInfos, issues }) =>
+    repoInfos.flatMap((repoInfo) =>
+      issues.map((issue) => ({
+        label: `#${issue.number} ${issue.title}`,
+        description: `${repoInfo.owner}/${repoInfo.repo} (${repoInfo.workspaceFolderName})`,
+        detail: `@${issue.author} | state: ${issue.state} | comments: ${issue.commentsCount} | ${repoInfo.rootPath}`,
+        owner: repoInfo.owner,
+        repo: repoInfo.repo,
+        issue,
+        rootPath: repoInfo.rootPath,
+        workspaceFolderName: repoInfo.workspaceFolderName
+      }))
+    )
   );
 
   if (quickPickItems.length === 0) {
@@ -1001,7 +1069,13 @@ async function selectIssueContext(token: string | undefined, input: WorkflowInpu
     return undefined;
   }
 
-  return { owner: selectedIssue.owner, repo: selectedIssue.repo, issue: selectedIssue.issue };
+  return {
+    owner: selectedIssue.owner,
+    repo: selectedIssue.repo,
+    issue: selectedIssue.issue,
+    rootPath: selectedIssue.rootPath,
+    workspaceFolderName: selectedIssue.workspaceFolderName
+  };
 }
 
 async function selectLocalChangesContext(input: WorkflowInputDefinition): Promise<{
@@ -1480,88 +1554,13 @@ async function tryRunGitCommand(repoRoot: string, args: string[]): Promise<strin
   }
 }
 
-async function resolveEngine(): Promise<ReviewEngine | undefined> {
-  const configured = vscode.workspace.getConfiguration("cmsisDev").get<string>("reviewEngine", "ask");
-  if (configured === "copilot" || configured === "codex") {
-    return configured;
-  }
-
-  const picked = await vscode.window.showQuickPick(
-    [
-      { label: "Copilot", value: "copilot" as const, detail: "Use a standard Copilot chat model." },
-      { label: "Codex", value: "codex" as const, detail: "Prefer a Codex-capable model when available." }
-    ],
-    { placeHolder: "Select AI engine" }
-  );
-
-  return picked?.value;
-}
-
-async function tryGenerateWithLm(prompt: string, engine: ReviewEngine): Promise<GeneratedReview | undefined> {
-  const vscodeAny = vscode as unknown as {
-    lm?: {
-      selectChatModels: (options?: { vendor?: string }) => Promise<any[]>;
-    };
-    LanguageModelChatMessage?: {
-      User: (text: string) => unknown;
-    };
-  };
-
-  if (!vscodeAny.lm?.selectChatModels || !vscodeAny.LanguageModelChatMessage?.User) {
-    return undefined;
-  }
-
-  try {
-    const models = await vscodeAny.lm.selectChatModels();
-    if (models.length === 0) {
-      return undefined;
-    }
-
-    const codexPatternRaw = vscode.workspace.getConfiguration("cmsisDev").get<string>("codexModelPattern", "codex|gpt-5");
-    const codexPattern = new RegExp(codexPatternRaw, "i");
-
-    const preferred =
-      engine === "codex"
-        ? models.find((model: any) => isCodexModel(model, codexPattern)) ?? models[0]
-        : models.find((model: any) => !isCodexModel(model, codexPattern)) ?? models[0];
-
-    if (engine === "codex" && !isCodexModel(preferred, codexPattern)) {
-      vscode.window.showWarningMessage("Codex model not found in available chat models. Falling back to first available model.");
-    }
-
-    const cancellation = new vscode.CancellationTokenSource();
-    const response = await preferred.sendRequest(
-      [vscodeAny.LanguageModelChatMessage.User(prompt)],
-      undefined,
-      cancellation.token
-    );
-
-    let text = "";
-    for await (const fragment of response.text) {
-      text += fragment;
-    }
-
-    const content = text.trim();
-    if (!content) {
-      return undefined;
-    }
-
-    return {
-      agentName: "VS Code Language Model",
-      modelName: formatLanguageModelName(preferred),
-      content
-    };
-  } catch {
-    return undefined;
-  }
-}
-
 async function tryGenerateWithCodexCli(prompt: string, options: CodexCliOptions = {}): Promise<GeneratedReview | undefined> {
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
   const cwd = workspaceFolder?.uri.fsPath ?? process.cwd();
   const cliExecutable =
     vscode.workspace.getConfiguration("chatgpt").get<string>("cliExecutable")?.trim() || "codex";
-  const configuredModel = await resolveCodexCliModel();
+  const configuredModel = await resolveEffectiveCodexModel();
+  const configuredReasoningEffort = await resolveEffectiveCodexReasoningEffort();
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "cmsis-dev-codex-cli-"));
   const outputPath = path.join(tempDir, "last-message.md");
 
@@ -1584,6 +1583,9 @@ async function tryGenerateWithCodexCli(prompt: string, options: CodexCliOptions 
       cliExecutable,
       [
         "exec",
+        ...(configuredModel !== "default" ? ["--model", configuredModel] : []),
+        "--config",
+        `model_reasoning_effort="${configuredReasoningEffort}"`,
         "--json",
         "--skip-git-repo-check",
         "--sandbox",
@@ -1670,19 +1672,6 @@ async function tryGenerateWithCodexCli(prompt: string, options: CodexCliOptions 
     child.stdin.write(prompt);
     child.stdin.end();
   });
-}
-
-function isCodexModel(model: { id?: string; name?: string; vendor?: string; family?: string }, codexPattern: RegExp): boolean {
-  const identifier = [model.vendor, model.family, model.id, model.name].filter(Boolean).join(" ");
-  return codexPattern.test(identifier);
-}
-
-function formatLanguageModelName(model: { id?: string; name?: string; vendor?: string; family?: string }): string {
-  const parts = [model.vendor, model.family, model.name ?? model.id].filter((part, index, all) =>
-    Boolean(part) && all.indexOf(part) === index
-  );
-
-  return parts.length > 0 ? parts.join(" / ") : "unknown";
 }
 
 async function writeOutputFile(
@@ -1778,6 +1767,26 @@ async function readOutputMetadata(outputUri: vscode.Uri): Promise<ActionOutputMe
   }
 }
 
+async function resolveOutputFileText(metadata: Pick<ActionOutputMetadata, "outputFile">): Promise<string | undefined> {
+  const outputPath = metadata.outputFile?.trim();
+  if (!outputPath) {
+    return undefined;
+  }
+
+  const openDocument = vscode.workspace.textDocuments.find(
+    (document) => document.uri.scheme === "file" && isSameFilePath(document.uri.fsPath, outputPath)
+  );
+  if (openDocument) {
+    return openDocument.getText();
+  }
+
+  try {
+    return await fs.readFile(outputPath, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
 function resolveWorkflowFollowUps(workflow: Pick<WorkflowDefinition, "id" | "type" | "followUps">): WorkflowFollowUp[] {
   const configured = normalizeFollowUps(workflow.followUps);
   if (configured.length > 0) {
@@ -1841,10 +1850,10 @@ function getActiveOutputFollowUpStateFromMetadata(metadata: ActionOutputMetadata
     canOpenReasoning: followUps.includes("openReasoning") && Boolean(metadata.reasoningFile),
     canOpenPr: followUps.includes("openPr") && Boolean(metadata.prContext?.pr.htmlUrl),
     canOpenIssue: followUps.includes("openIssue") && Boolean(metadata.issueContext?.issue.htmlUrl),
-    canPostComment: followUps.includes("postComment") && Boolean(metadata.prContext) && Boolean(metadata.generatedOutput),
+    canPostComment: followUps.includes("postComment") && Boolean(metadata.prContext) && Boolean(metadata.outputFile),
     canSubmitPr:
       followUps.includes("submitPr") &&
-      Boolean(metadata.pullRequestDraft?.title) &&
+      Boolean(metadata.outputFile) &&
       Boolean(metadata.localChangesContext?.rootPath) &&
       Boolean(metadata.localChangesContext?.owner) &&
       Boolean(metadata.localChangesContext?.repo),
@@ -1856,8 +1865,9 @@ function getActiveOutputFollowUpStateFromMetadata(metadata: ActionOutputMetadata
 }
 
 function buildCodexChatStarterPrompt(metadata: ActionOutputMetadata): string | undefined {
-  if (metadata.openCodexChatPrompt?.trim()) {
-    return metadata.openCodexChatPrompt;
+  const configuredPrompt = metadata.openCodexChatPrompt?.trim();
+  if (configuredPrompt) {
+    return appendWorkspaceRepoContext(configuredPrompt, metadata);
   }
 
   if (
@@ -1866,26 +1876,94 @@ function buildCodexChatStarterPrompt(metadata: ActionOutputMetadata): string | u
     metadata.prContext ||
     (metadata.localChangesContext && !metadata.pullRequestDraft)
   ) {
-    return [
+    return appendWorkspaceRepoContext(
+      [
       "Use the attached CMSIS-Dev reasoning file as the source of truth.",
       "It contains the generated review plus the workflow context that produced it.",
       "Identify the concrete review suggestions worth implementing in this workspace.",
       "Start with a short plan, then implement the accepted changes.",
       "If any finding is unclear, unsupported, or too risky, explain that before editing."
-    ].join("\n");
+      ].join("\n"),
+      metadata
+    );
   }
 
   if (metadata.workflowId === "explain-issue" || metadata.issueContext) {
-    return [
+    return appendWorkspaceRepoContext(
+      [
       "Use the attached CMSIS-Dev reasoning file as context.",
       "It contains the generated issue explanation plus the workflow context that produced it.",
       "Ask the smallest set of concrete follow-up questions needed to resolve the open questions or missing information.",
       "Group related questions together and avoid repeating facts already established in the attached explanation.",
       "If some missing information can be inferred from the local repo, investigate that first before asking."
-    ].join("\n");
+      ].join("\n"),
+      metadata
+    );
   }
 
   return undefined;
+}
+
+async function resolveWorkspaceRepoForRemote(
+  owner: string,
+  repo: string
+): Promise<{ rootPath: string; workspaceFolderName: string } | undefined> {
+  const matches = (await resolveGitReposFromWorkspace()).filter(
+    (workspaceRepo) =>
+      workspaceRepo.owner?.toLowerCase() === owner.toLowerCase() && workspaceRepo.repo?.toLowerCase() === repo.toLowerCase()
+  );
+
+  if (matches.length === 0) {
+    return undefined;
+  }
+
+  if (matches.length === 1) {
+    return {
+      rootPath: matches[0].rootPath,
+      workspaceFolderName: matches[0].workspaceFolderName
+    };
+  }
+
+  const selected = await vscode.window.showQuickPick(
+    matches.map((workspaceRepo) => ({
+      label: `${owner}/${repo}`,
+      description: `${workspaceRepo.workspaceFolderName} | ${workspaceRepo.rootPath}`,
+      repo: workspaceRepo
+    })),
+    {
+      placeHolder: `Select the local workspace repository for ${owner}/${repo}`
+    }
+  );
+
+  if (!selected) {
+    return undefined;
+  }
+
+  return {
+    rootPath: selected.repo.rootPath,
+    workspaceFolderName: selected.repo.workspaceFolderName
+  };
+}
+
+function appendWorkspaceRepoContext(prompt: string, metadata: ActionOutputMetadata): string {
+  const repoRoot =
+    metadata.localChangesContext?.rootPath ?? metadata.prContext?.rootPath ?? metadata.issueContext?.rootPath;
+  const workspaceFolderName =
+    metadata.localChangesContext?.workspaceFolderName ??
+    metadata.prContext?.workspaceFolderName ??
+    metadata.issueContext?.workspaceFolderName;
+
+  if (!repoRoot) {
+    return prompt;
+  }
+
+  const lines = [prompt.trimEnd(), "", "Local workspace repo for this workflow:"];
+  if (workspaceFolderName) {
+    lines.push(`- Workspace folder: ${workspaceFolderName}`);
+  }
+  lines.push(`- Repo root: ${repoRoot}`);
+  lines.push("- Paths mentioned in the attached reasoning are relative to this repo root.");
+  return lines.join("\n");
 }
 async function openNewCodexChatBestEffort(): Promise<CodexChatLaunchResult> {
   const availableCommands = new Set(await vscode.commands.getCommands(true));
@@ -2001,12 +2079,55 @@ function parsePullRequestDraft(content: string): PullRequestDraft | undefined {
   return { title, body };
 }
 
+function parsePullRequestDraftFromOutputFile(content: string): PullRequestDraft | undefined {
+  const direct = parsePullRequestDraft(content);
+  if (direct) {
+    return direct;
+  }
+
+  const normalized = content.replace(/\r\n/g, "\n").trim();
+  if (!normalized) {
+    return undefined;
+  }
+
+  const lines = normalized.split("\n");
+  let index = 0;
+  while (index < lines.length && lines[index].startsWith(">")) {
+    index += 1;
+  }
+  while (index < lines.length && lines[index].trim().length === 0) {
+    index += 1;
+  }
+
+  const bodyWithoutPreamble = lines.slice(index).join("\n").trim();
+  if (!bodyWithoutPreamble) {
+    return undefined;
+  }
+
+  const markdownMatch = bodyWithoutPreamble.match(/^#\s+(.+?)\n+([\s\S]+)$/);
+  if (!markdownMatch) {
+    return undefined;
+  }
+
+  const title = markdownMatch[1].trim();
+  const body = markdownMatch[2].trim();
+  if (!title || !body) {
+    return undefined;
+  }
+
+  return { title, body };
+}
+
 function renderPullRequestDraftOutput(content: string, draft: PullRequestDraft | undefined): string {
   if (!draft) {
     return content.trim();
   }
 
   return [`# ${draft.title}`, "", draft.body].join("\n").trim();
+}
+
+function isSameFilePath(left: string, right: string): boolean {
+  return path.normalize(left).toLowerCase() === path.normalize(right).toLowerCase();
 }
 
 async function generatePullRequestBranchName(
@@ -2214,16 +2335,4 @@ function renderOutputWithExecutionInfo(
     "",
     content.trim()
   ].join("\n");
-}
-
-async function resolveCodexCliModel(): Promise<string> {
-  try {
-    const codexHome = process.env.CODEX_HOME?.trim() || path.join(os.homedir(), ".codex");
-    const configPath = path.join(codexHome, "config.toml");
-    const raw = await fs.readFile(configPath, "utf8");
-    const match = raw.match(/^\s*model\s*=\s*["']([^"']+)["']/m);
-    return match?.[1]?.trim() || "default";
-  } catch {
-    return "default";
-  }
 }

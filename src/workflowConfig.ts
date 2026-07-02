@@ -15,6 +15,14 @@ type StarterWorkflowAssets = {
   workflowsById: Map<string, WorkflowDefinition>;
 };
 
+export type WorkflowConfigSource = "installed" | "workspace";
+
+export type WorkflowConfigFile = {
+  uri: vscode.Uri;
+  source: WorkflowConfigSource;
+  workflowIds: string[];
+};
+
 let starterWorkflowAssetsPromise: Promise<StarterWorkflowAssets> | undefined;
 
 function getBundledCmsisDevDir(): string {
@@ -58,33 +66,40 @@ async function loadStarterWorkflowAssets(): Promise<StarterWorkflowAssets> {
 }
 
 export async function loadWorkflowDefinitions(): Promise<WorkflowDefinition[]> {
-  const workflowConfigUri = await resolveWorkflowConfigUri();
-  if (!workflowConfigUri || workflowConfigUri.scheme !== "file") {
-    return [];
-  }
+  const starterAssets = await getStarterWorkflowAssets();
+  const workspaceWorkflowConfigUri = await resolveWorkspaceWorkflowConfigUri();
+  const workspaceWorkflows =
+    workspaceWorkflowConfigUri?.scheme === "file" ? await readWorkflowDefinitions(workspaceWorkflowConfigUri.fsPath) : [];
 
-  const workflows = await readWorkflowDefinitions(workflowConfigUri.fsPath);
-  return normalizeWorkflows(workflows);
+  return normalizeWorkflows(mergeWorkflowDefinitions(starterAssets.workflows, workspaceWorkflows));
 }
 
 export async function initializeWorkflowConfig(): Promise<vscode.Uri | undefined> {
   const workflowConfigUri = await getInitializationWorkflowConfigUri();
   if (!workflowConfigUri || workflowConfigUri.scheme !== "file") {
-    vscode.window.showWarningMessage("Open a workspace folder before initializing workflows.");
+    vscode.window.showWarningMessage("Open a workspace folder before creating workflow overrides.");
     return undefined;
   }
 
   const absolutePath = workflowConfigUri.fsPath;
+  const alreadyExists = await fileExists(absolutePath);
   if (isYamlPath(absolutePath)) {
     const createdUri = await initializeWorkflowConfigFile(absolutePath);
     const doc = await vscode.workspace.openTextDocument(createdUri);
     await vscode.window.showTextDocument(doc);
+    if (!alreadyExists) {
+      void vscode.window.showInformationMessage(`Workspace workflow overrides created at '${createdUri.fsPath}'.`);
+    }
     return createdUri;
   }
 
   const createdUri = await initializeWorkflowConfigDirectory(absolutePath);
   await vscode.commands.executeCommand("revealInExplorer", createdUri);
-  void vscode.window.showInformationMessage(`Workflow config initialized in '${createdUri.fsPath}'.`);
+  void vscode.window.showInformationMessage(
+    alreadyExists
+      ? `Workspace workflow overrides already available in '${createdUri.fsPath}'.`
+      : `Workspace workflow overrides created in '${createdUri.fsPath}'.`
+  );
   return createdUri;
 }
 
@@ -92,7 +107,20 @@ export function getConfiguredWorkflowConfigPath(): string {
   return vscode.workspace.getConfiguration("cmsisDev").get<string>("workflowConfigPath", DEFAULT_WORKFLOW_CONFIG_PATH);
 }
 
+export function resolveBundledWorkflowConfigUri(): vscode.Uri {
+  return vscode.Uri.file(getBundledWorkflowsDir());
+}
+
 export async function resolveWorkflowConfigUri(createIfMissing = false): Promise<vscode.Uri | undefined> {
+  const workspaceWorkflowConfigUri = await resolveWorkspaceWorkflowConfigUri(createIfMissing);
+  if (workspaceWorkflowConfigUri || createIfMissing) {
+    return workspaceWorkflowConfigUri;
+  }
+
+  return resolveBundledWorkflowConfigUri();
+}
+
+export async function resolveWorkspaceWorkflowConfigUri(createIfMissing = false): Promise<vscode.Uri | undefined> {
   const configuredPath = getConfiguredWorkflowConfigPath();
   const workspaceFolders = getResolutionWorkspaceFolders();
   const workspaceFileBaseDir = getWorkspaceFileBaseDir();
@@ -152,12 +180,31 @@ export async function resolveWorkflowConfigUri(createIfMissing = false): Promise
   return undefined;
 }
 
+export async function listEffectiveWorkflowConfigFiles(): Promise<WorkflowConfigFile[]> {
+  const starterFiles = await listWorkflowConfigFilesForPath(getBundledWorkflowsDir(), "installed");
+  const workspaceWorkflowConfigUri = await resolveWorkspaceWorkflowConfigUri();
+  const workspaceFiles =
+    workspaceWorkflowConfigUri?.scheme === "file"
+      ? await listWorkflowConfigFilesForPath(workspaceWorkflowConfigUri.fsPath, "workspace")
+      : [];
+
+  const overriddenWorkflowIds = new Set(workspaceFiles.flatMap((file) => file.workflowIds));
+  const visibleStarterFiles = starterFiles.filter(
+    (file) => file.workflowIds.length === 0 || file.workflowIds.some((workflowId) => !overriddenWorkflowIds.has(workflowId))
+  );
+
+  return [...workspaceFiles, ...visibleStarterFiles];
+}
+
 export async function resolveWorkflowRunsDirUri(createIfMissing = false): Promise<vscode.Uri | undefined> {
-  const workflowConfigUri = await resolveWorkflowConfigUri(createIfMissing);
+  const workflowConfigUri = await resolveWorkspaceWorkflowConfigUri(createIfMissing);
+  const workspaceFileBaseDir = getWorkspaceFileBaseDir();
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
   const runsDirPath =
     workflowConfigUri?.scheme === "file"
       ? path.join(path.dirname(workflowConfigUri.fsPath), "runs")
+      : workspaceFileBaseDir
+        ? path.join(workspaceFileBaseDir, ".cmsis-dev", "runs")
       : workspaceFolder
         ? path.join(workspaceFolder.uri.fsPath, ".cmsis-dev", "runs")
         : undefined;
@@ -228,8 +275,8 @@ async function pickWorkspaceFolderForInitialization(): Promise<vscode.WorkspaceF
       folder
     })),
     {
-      title: "Initialize Workflow Config",
-      placeHolder: "Choose the workspace folder where the workflow config should be created"
+      title: "Create Workflow Overrides",
+      placeHolder: "Choose the workspace folder where the workflow overrides should be created"
     }
   );
 
@@ -265,6 +312,45 @@ async function readWorkflowDefinitions(workflowConfigPath: string): Promise<Work
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     void vscode.window.showWarningMessage(`Failed to load workflow config '${workflowConfigPath}': ${message}`);
+    return [];
+  }
+}
+
+async function listWorkflowConfigFilesForPath(
+  workflowConfigPath: string,
+  source: WorkflowConfigSource
+): Promise<WorkflowConfigFile[]> {
+  try {
+    const stats = await fs.stat(workflowConfigPath);
+    if (stats.isDirectory()) {
+      const entries = (await fs.readdir(workflowConfigPath))
+        .filter((entry) => isYamlPath(entry))
+        .sort((left, right) => left.localeCompare(right));
+
+      return Promise.all(
+        entries.map(async (entry) => {
+          const uri = vscode.Uri.file(path.join(workflowConfigPath, entry));
+          return {
+            uri,
+            source,
+            workflowIds: await readWorkflowIdsFromFile(uri.fsPath)
+          };
+        })
+      );
+    }
+
+    if (!isYamlPath(workflowConfigPath)) {
+      return [];
+    }
+
+    return [
+      {
+        uri: vscode.Uri.file(workflowConfigPath),
+        source,
+        workflowIds: await readWorkflowIdsFromFile(workflowConfigPath)
+      }
+    ];
+  } catch {
     return [];
   }
 }
@@ -317,9 +403,16 @@ async function readWorkflowDefinitionsFromFile(workflowConfigPath: string): Prom
   }
 }
 
+async function readWorkflowIdsFromFile(workflowConfigPath: string): Promise<string[]> {
+  const workflows = await readWorkflowDefinitionsFromFile(workflowConfigPath);
+  return workflows
+    .map((workflow) => workflow.id)
+    .filter((workflowId): workflowId is string => typeof workflowId === "string" && workflowId.trim().length > 0);
+}
+
 async function initializeWorkflowConfigFile(workflowConfigPath: string): Promise<vscode.Uri> {
   await fs.mkdir(path.dirname(workflowConfigPath), { recursive: true });
-  await writeWorkflowSchemaFileForConfigPath(workflowConfigPath, false);
+  await writeWorkflowSchemaFileForConfigPath(workflowConfigPath);
 
   const existing = await fileExists(workflowConfigPath);
   if (!existing) {
@@ -335,7 +428,7 @@ async function initializeWorkflowConfigFile(workflowConfigPath: string): Promise
 
 async function initializeWorkflowConfigDirectory(workflowConfigDir: string): Promise<vscode.Uri> {
   await fs.mkdir(workflowConfigDir, { recursive: true });
-  await writeWorkflowSchemaFileForConfigPath(workflowConfigDir, true);
+  await writeWorkflowSchemaFileForConfigPath(workflowConfigDir);
 
   const existingEntries = await fs.readdir(workflowConfigDir).catch(() => []);
   const existingWorkflowFiles = existingEntries.filter((entry) => isYamlPath(entry));
@@ -357,11 +450,36 @@ function renderWorkflowConfigFile(content: { workflows: WorkflowDefinition[] }):
   return `# yaml-language-server: $schema=./${WORKFLOW_SCHEMA_FILENAME}\n${stringify(content)}`;
 }
 
-async function writeWorkflowSchemaFileForConfigPath(targetPath: string, isDirectory: boolean): Promise<void> {
-  const schemaDir = isDirectory ? path.dirname(targetPath) : path.dirname(targetPath);
+async function writeWorkflowSchemaFileForConfigPath(targetPath: string): Promise<void> {
+  const schemaDir = isYamlPath(targetPath) ? path.dirname(targetPath) : targetPath;
   const schemaPath = path.join(schemaDir, WORKFLOW_SCHEMA_FILENAME);
   const schemaContent = await fs.readFile(getBundledWorkflowSchemaPath(), "utf8");
   await fs.writeFile(schemaPath, schemaContent, "utf8");
+}
+
+function mergeWorkflowDefinitions(
+  installedWorkflows: WorkflowDefinition[],
+  workspaceWorkflows: WorkflowDefinition[]
+): WorkflowDefinition[] {
+  const merged = new Map<string, WorkflowDefinition>();
+
+  for (const workflow of installedWorkflows) {
+    if (!workflow.id || merged.has(workflow.id)) {
+      continue;
+    }
+
+    merged.set(workflow.id, workflow);
+  }
+
+  for (const workflow of workspaceWorkflows) {
+    if (!workflow.id) {
+      continue;
+    }
+
+    merged.set(workflow.id, workflow);
+  }
+
+  return Array.from(merged.values());
 }
 
 function dedupeWorkflowDefinitions(workflows: WorkflowDefinition[], sourceLabel: string): WorkflowDefinition[] {

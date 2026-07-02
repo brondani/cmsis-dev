@@ -1,19 +1,20 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { resolveWorkflowConfigUri } from "./workflowConfig";
+import { listEffectiveWorkflowConfigFiles, WorkflowConfigSource } from "./workflowConfig";
 
 class WorkflowFileItem extends vscode.TreeItem {
   readonly modifiedAt: number;
 
   constructor(
     public readonly uri: vscode.Uri,
+    public readonly source: WorkflowConfigSource,
     modifiedAt: number
   ) {
     super(path.basename(uri.fsPath), vscode.TreeItemCollapsibleState.None);
     this.modifiedAt = modifiedAt;
     this.resourceUri = uri;
-    this.description = new Date(modifiedAt).toLocaleString();
+    this.description = `${source === "workspace" ? "workspace" : "installed"} | ${new Date(modifiedAt).toLocaleString()}`;
     this.tooltip = uri.fsPath;
     this.contextValue = "cmsisDev.workflowFile";
     this.command = {
@@ -56,40 +57,14 @@ export class WorkflowsProvider implements vscode.TreeDataProvider<WorkflowsTreeI
   }
 
   private async loadWorkflowFiles(): Promise<WorkflowFileItem[]> {
-    const workflowConfigUri = await resolveWorkflowConfigUri();
-    if (!workflowConfigUri || workflowConfigUri.scheme !== "file") {
-      return [];
-    }
+    const files = await listEffectiveWorkflowConfigFiles();
+    const items = await Promise.all(
+      files.map(async (file) => {
+        const stat = await fs.stat(file.uri.fsPath);
+        return new WorkflowFileItem(file.uri, file.source, stat.mtimeMs);
+      })
+    );
 
-    try {
-      const stat = await fs.stat(workflowConfigUri.fsPath);
-      if (stat.isFile()) {
-        if (!isWorkflowYamlFile(workflowConfigUri.fsPath)) {
-          return [];
-        }
-
-        return [new WorkflowFileItem(workflowConfigUri, stat.mtimeMs)];
-      }
-
-      const entries = await fs.readdir(workflowConfigUri.fsPath, { withFileTypes: true });
-      const files = await Promise.all(
-        entries
-          .filter((entry) => entry.isFile() && isWorkflowYamlFile(entry.name))
-          .map(async (entry) => {
-            const uri = vscode.Uri.file(path.join(workflowConfigUri.fsPath, entry.name));
-            const entryStat = await fs.stat(uri.fsPath);
-            return new WorkflowFileItem(uri, entryStat.mtimeMs);
-          })
-      );
-
-      return files.sort((left, right) => left.label!.toString().localeCompare(right.label!.toString()));
-    } catch {
-      return [];
-    }
+    return items;
   }
-}
-
-function isWorkflowYamlFile(targetPath: string): boolean {
-  const extension = path.extname(targetPath).toLowerCase();
-  return extension === ".yml" || extension === ".yaml";
 }

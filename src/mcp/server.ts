@@ -108,8 +108,10 @@ async function start(): Promise<void> {
 }
 
 async function registerWorkflowTools(): Promise<void> {
-  const workflowConfigPath = await resolveWorkflowConfigPath();
-  const workflows = dedupeWorkflows(await loadWorkflowDefinitions(workflowConfigPath));
+  const bundledWorkflowConfigPath = resolveBundledWorkflowConfigPath();
+  const workspaceWorkflowConfigPath = await resolveWorkspaceWorkflowConfigPath();
+  const workflowRunsDirPath = resolveWorkflowRunsDirPath(workspaceWorkflowConfigPath);
+  const workflows = dedupeWorkflows(await loadEffectiveWorkflowDefinitions(bundledWorkflowConfigPath, workspaceWorkflowConfigPath));
   const registeredToolNames = new Set<string>();
 
   for (const workflow of workflows) {
@@ -133,7 +135,7 @@ async function registerWorkflowTools(): Promise<void> {
 
     registeredToolNames.add(toolName);
     mcpServer.tool(toolName, schema, async (args: Record<string, unknown>) => {
-      const values = await resolveWorkflowValues(workflow, workflowConfigPath, args);
+      const values = await resolveWorkflowValues(workflow, workflowRunsDirPath, args);
       const prompt = renderPromptTemplate(promptTemplate, values);
       return {
         content: [
@@ -203,7 +205,7 @@ function buildWorkflowToolSchema(workflow: WorkflowDefinition): WorkflowToolSche
 
 async function resolveWorkflowValues(
   workflow: WorkflowDefinition,
-  workflowConfigPath: string,
+  workflowRunsDirPath: string,
   args: Record<string, unknown>
 ): Promise<Record<string, string>> {
   const values: Record<string, string> = {};
@@ -247,7 +249,7 @@ async function resolveWorkflowValues(
     if (input.type === "git-local-changes-context") {
       const names = getLocalChangesArgNames(input.id, localChangesCount);
       const repoPath = expectStringArg(args, names.repoPath);
-      const localChanges = await collectLocalChangesValues(repoPath, input.id, workflowConfigPath);
+      const localChanges = await collectLocalChangesValues(repoPath, input.id, workflowRunsDirPath);
       Object.assign(values, localChanges.values);
       continue;
     }
@@ -332,7 +334,7 @@ function applyIssueValues(
 async function collectLocalChangesValues(
   repoRoot: string,
   inputId: string,
-  workflowConfigPath: string
+  workflowRunsDirPath: string
 ): Promise<{ context: LocalChangesContext; values: Record<string, string> }> {
   const defaultRef = await resolveDefaultBranchRef(repoRoot);
   if (!defaultRef) {
@@ -347,7 +349,7 @@ async function collectLocalChangesValues(
   }
 
   const fileSections = await formatLocalChangeSections(repoRoot, defaultRef.ref, changedEntries, untrackedFiles);
-  const latestLocalReview = await findLatestLocalReviewSummary(repoRoot, workflowConfigPath);
+  const latestLocalReview = await findLatestLocalReviewSummary(repoRoot, workflowRunsDirPath);
   const pullRequestTemplates = await readPullRequestTemplates(repoRoot);
   const changedFilesList = [...changedEntries.map((entry) => entry.displayPath), ...untrackedFiles];
   const uniqueChangedFiles = Array.from(new Set(changedFilesList));
@@ -598,15 +600,14 @@ async function readPullRequestTemplates(repoRoot: string): Promise<string> {
   return sections.length > 0 ? sections.join("\n\n---\n\n") : "(No pull request templates found)";
 }
 
-async function findLatestLocalReviewSummary(repoRoot: string, workflowConfigPath: string): Promise<string> {
-  const runsDirPath = resolveWorkflowRunsDirPath(workflowConfigPath);
+async function findLatestLocalReviewSummary(repoRoot: string, workflowRunsDirPath: string): Promise<string> {
   let metadataFiles: string[] = [];
 
   try {
-    const entries = await fs.readdir(runsDirPath, { withFileTypes: true });
+    const entries = await fs.readdir(workflowRunsDirPath, { withFileTypes: true });
     metadataFiles = entries
       .filter((entry) => entry.isFile() && entry.name.endsWith(".meta.json"))
-      .map((entry) => path.join(runsDirPath, entry.name));
+      .map((entry) => path.join(workflowRunsDirPath, entry.name));
   } catch {
     return "(No previous local review found)";
   }
@@ -863,13 +864,36 @@ function parseRepoFromRemote(remoteUrl: string): { owner: string; repo: string }
   return undefined;
 }
 
-function resolveWorkflowRunsDirPath(workflowConfigPath: string): string {
-  return path.join(path.dirname(workflowConfigPath), "runs");
+function resolveBundledWorkflowConfigPath(): string {
+  const fromEnv = process.env.CMSIS_DEV_BUNDLED_WORKFLOW_CONFIG?.trim();
+  if (fromEnv) {
+    return fromEnv;
+  }
+
+  const extensionPath = process.env.CMSIS_DEV_EXTENSION_PATH?.trim();
+  if (extensionPath) {
+    return path.join(extensionPath, ".cmsis-dev", "workflows");
+  }
+
+  return path.resolve(__dirname, "..", "..", ".cmsis-dev", "workflows");
 }
 
-async function resolveWorkflowConfigPath(): Promise<string> {
-  const fromEnv = process.env.CMSIS_DEV_WORKFLOW_CONFIG?.trim();
+function resolveWorkflowRunsDirPath(workspaceWorkflowConfigPath?: string): string {
+  const fromEnv = process.env.CMSIS_DEV_WORKFLOW_RUNS_DIR?.trim();
   if (fromEnv) {
+    return fromEnv;
+  }
+
+  if (workspaceWorkflowConfigPath) {
+    return path.join(path.dirname(workspaceWorkflowConfigPath), "runs");
+  }
+
+  return path.join(process.cwd(), ".cmsis-dev", "runs");
+}
+
+async function resolveWorkspaceWorkflowConfigPath(): Promise<string | undefined> {
+  const fromEnv = process.env.CMSIS_DEV_WORKSPACE_WORKFLOW_CONFIG?.trim();
+  if (fromEnv && (await fileExists(fromEnv))) {
     return fromEnv;
   }
 
@@ -888,7 +912,7 @@ async function resolveWorkflowConfigPath(): Promise<string> {
     return nestedPath;
   }
 
-  return directPath;
+  return undefined;
 }
 
 async function findNestedWorkflowConfig(rootDir: string, maxDepth: number): Promise<string | undefined> {
@@ -940,43 +964,67 @@ async function fileExists(targetPath: string): Promise<boolean> {
   }
 }
 
-async function loadWorkflowDefinitions(workflowConfigPath: string): Promise<WorkflowDefinition[]> {
-  const stats = await fs.stat(workflowConfigPath);
-  if (stats.isDirectory()) {
-    const entries = (await fs.readdir(workflowConfigPath))
-      .filter((entry) => entry.toLowerCase().endsWith(".yml") || entry.toLowerCase().endsWith(".yaml"))
-      .sort((left, right) => left.localeCompare(right));
-    const loaded = await Promise.all(entries.map((entry) => loadWorkflowDefinitionsFromFile(path.join(workflowConfigPath, entry))));
-    return loaded.flat();
-  }
+async function loadEffectiveWorkflowDefinitions(
+  bundledWorkflowConfigPath: string,
+  workspaceWorkflowConfigPath?: string
+): Promise<WorkflowDefinition[]> {
+  const [bundledWorkflows, workspaceWorkflows] = await Promise.all([
+    loadWorkflowDefinitions(bundledWorkflowConfigPath),
+    workspaceWorkflowConfigPath ? loadWorkflowDefinitions(workspaceWorkflowConfigPath) : Promise.resolve([])
+  ]);
 
-  return loadWorkflowDefinitionsFromFile(workflowConfigPath);
+  return mergeWorkflowDefinitions(bundledWorkflows, workspaceWorkflows);
+}
+
+async function loadWorkflowDefinitions(workflowConfigPath: string): Promise<WorkflowDefinition[]> {
+  try {
+    const stats = await fs.stat(workflowConfigPath);
+    if (stats.isDirectory()) {
+      const entries = (await fs.readdir(workflowConfigPath))
+        .filter((entry) => entry.toLowerCase().endsWith(".yml") || entry.toLowerCase().endsWith(".yaml"))
+        .sort((left, right) => left.localeCompare(right));
+      const loaded = await Promise.all(entries.map((entry) => loadWorkflowDefinitionsFromFile(path.join(workflowConfigPath, entry))));
+      return loaded.flat();
+    }
+
+    return loadWorkflowDefinitionsFromFile(workflowConfigPath);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[CMSIS-Dev MCP] Failed to load workflow config '${workflowConfigPath}': ${message}`);
+    return [];
+  }
 }
 
 async function loadWorkflowDefinitionsFromFile(workflowConfigPath: string): Promise<WorkflowDefinition[]> {
-  const raw = await fs.readFile(workflowConfigPath, "utf8");
-  const parsed = parse(raw) as
-    | { workflows?: WorkflowDefinition[]; workflow?: WorkflowDefinition }
-    | WorkflowDefinition
-    | undefined;
+  try {
+    const raw = await fs.readFile(workflowConfigPath, "utf8");
+    const parsed = parse(raw) as
+      | { workflows?: WorkflowDefinition[]; workflow?: WorkflowDefinition }
+      | WorkflowDefinition
+      | undefined;
 
-  if (!parsed) {
+    if (!parsed) {
+      return [];
+    }
+
+    if (Array.isArray((parsed as { workflows?: WorkflowDefinition[] }).workflows)) {
+      return (parsed as { workflows: WorkflowDefinition[] }).workflows;
+    }
+
+    if ((parsed as { workflow?: WorkflowDefinition }).workflow) {
+      return [(parsed as { workflow: WorkflowDefinition }).workflow];
+    }
+
+    if (isWorkflowDefinition(parsed)) {
+      return [parsed];
+    }
+
+    return [];
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[CMSIS-Dev MCP] Failed to parse workflow config '${workflowConfigPath}': ${message}`);
     return [];
   }
-
-  if (Array.isArray((parsed as { workflows?: WorkflowDefinition[] }).workflows)) {
-    return (parsed as { workflows: WorkflowDefinition[] }).workflows;
-  }
-
-  if ((parsed as { workflow?: WorkflowDefinition }).workflow) {
-    return [(parsed as { workflow: WorkflowDefinition }).workflow];
-  }
-
-  if (isWorkflowDefinition(parsed)) {
-    return [parsed];
-  }
-
-  return [];
 }
 
 function isWorkflowDefinition(value: unknown): value is WorkflowDefinition {
@@ -997,6 +1045,31 @@ function dedupeWorkflows(workflows: WorkflowDefinition[]): WorkflowDefinition[] 
     unique.set(workflow.id, workflow);
   }
   return Array.from(unique.values());
+}
+
+function mergeWorkflowDefinitions(
+  bundledWorkflows: WorkflowDefinition[],
+  workspaceWorkflows: WorkflowDefinition[]
+): WorkflowDefinition[] {
+  const merged = new Map<string, WorkflowDefinition>();
+
+  for (const workflow of bundledWorkflows) {
+    if (!workflow.id || merged.has(workflow.id)) {
+      continue;
+    }
+
+    merged.set(workflow.id, workflow);
+  }
+
+  for (const workflow of workspaceWorkflows) {
+    if (!workflow.id) {
+      continue;
+    }
+
+    merged.set(workflow.id, workflow);
+  }
+
+  return Array.from(merged.values());
 }
 
 function renderPromptTemplate(template: string, values: Record<string, string>): string {
