@@ -67,12 +67,6 @@
         "promptTemplate": {
           "type": "string"
         },
-        "openChatPromptTemplate": {
-          "type": "string"
-        },
-        "openCodexChatPromptTemplate": {
-          "type": "string"
-        },
         "followUps": {
           "type": "array",
           "uniqueItems": true,
@@ -83,9 +77,7 @@
               "openPr",
               "openIssue",
               "postComment",
-              "submitPr",
-              "openChat",
-              "openCodexChat"
+              "submitPr"
             ]
           }
         },
@@ -120,7 +112,8 @@
             "text",
             "github-pr-context",
             "github-issue-context",
-            "git-local-changes-context"
+            "git-local-changes-context",
+            "run-output-context"
           ]
         },
         "placeholder": {

@@ -5,21 +5,13 @@ description: Review local repository changes.
 type: review-changes
 followUps:
   - openReasoning
-  - openChat
-openChatPromptTemplate: |
-  Use the CMSIS-Dev reasoning file as the source of truth.
-  If it is not already attached in chat, add it before you send this prompt.
-  It contains the generated review plus the workflow context that produced it.
-  Identify the concrete review suggestions worth implementing in this workspace.
-  Start with a short plan, then implement the accepted changes.
-  If any finding is unclear, unsupported, or too risky, explain that before editing.
 inputs:
   - id: localChanges
     label: Repository
     type: git-local-changes-context
     required: true
 promptTemplate: |
-  You are Codex acting as a senior reviewer. Produce a detailed, actionable code review for the local changes in this repository compared to the HEAD of the default branch.
+  You are Codex acting as a senior reviewer. Produce a detailed, actionable code review for the tracked local changes in this repository compared to the HEAD of the default branch.
   Focus on correctness, regressions, edge cases, reliability, security, maintainability, and tests.
   Use this output format:
   1) Findings (ordered by severity: High, Medium, Low)

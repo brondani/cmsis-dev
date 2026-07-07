@@ -17,7 +17,7 @@ CMSIS-Dev has three runtime layers:
 
 1. The VS Code extension owns UI, workflow discovery, input collection, prompt construction, AI execution, output persistence, and follow-up actions.
 2. The MCP server exposes the same workflow catalog as MCP tools, resolving supported inputs and returning rendered prompts.
-3. The AI backend layer is adapter-based: the extension can execute actions through VS Code language models or through Codex CLI.
+3. The AI execution layer uses VS Code language models for workflow generation.
 
 ```mermaid
 flowchart LR
@@ -28,8 +28,8 @@ flowchart LR
     FollowUps["Follow-up Actions\npost comment / submit PR / open chat"]
   end
 
-  subgraph AI["AI Backend Layer"]
-    Models["VS Code LM / Codex CLI"]
+  subgraph AI["AI Execution Layer"]
+    Models["VS Code Language Models"]
   end
 
   subgraph External["External Systems"]
@@ -75,7 +75,7 @@ The extension entrypoint is `src/extension.ts`. It wires together four responsib
 The UI surface is intentionally thin:
 
 - `ActionsProvider` shows runnable workflows loaded from the registry.
-- The `Actions` view title exposes AI backend and model controls and shows the effective selection as view description text.
+- The `Actions` view title exposes model controls and shows the effective selection as view description text.
 - `WorkflowsProvider` shows the effective workflow files, labeled as `installed` or `workspace`.
 - `RunsProvider` shows generated outputs from the runs directory and supports multi-select deletion.
 
@@ -99,16 +99,13 @@ Each registered tool:
 
 The MCP server is intentionally narrower than the extension. It does not run models, persist output files, or perform VS Code follow-up actions. Its job is prompt materialization and tool exposure.
 
-## AI Backend Layer
-
-The AI backend is an adapter boundary inside `src/workflows/promptWorkflow.ts`.
+## AI Execution Layer
 
 Current execution logic:
 
-- `generateWithConfiguredBackend()` selects either VS Code language models or Codex CLI.
 - `tryGenerateWithVsCodeLm()` uses `vscode.lm` and can also be driven from the `@cmsisdev` chat participant.
 - `src/languageModelProvider.ts` contributes a CMSIS-Dev language model provider backed by an OpenAI-compatible proxy.
-- Codex-specific model and reasoning overrides remain available only when the backend is `codexCli`.
+- `src/aiSettings.ts` resolves either an explicitly selected VS Code model or the preferred automatic fallback.
 
 This keeps model execution separate from workflow definition. A workflow does not know which concrete provider or model has been selected for the run.
 
@@ -162,7 +159,6 @@ export interface WorkflowDefinition {
   type: string;
   inputs: WorkflowInputDefinition[];
   promptTemplate?: string;
-  openChatPromptTemplate?: string;
   followUps?: WorkflowFollowUp[];
 }
 ```
@@ -181,7 +177,6 @@ Supported follow-ups:
 - `openIssue`
 - `postComment`
 - `submitPr`
-- `openChat`
 
 The YAML schema is enforced in `src/workflowDiagnostics.ts`, which validates open workflow documents and surfaces errors as VS Code diagnostics.
 
@@ -204,7 +199,7 @@ That flat-value contract is a strong design choice for an MVP:
 - templates stay string-based,
 - new providers can be added without changing the renderer.
 
-## Backend Adapters
+## Language Model Integration
 
 The execution pipeline depends on one narrow generated-output shape:
 
@@ -216,11 +211,11 @@ interface GeneratedReview {
 }
 ```
 
-As long as a backend adapter can return that structure, it can plug into the current pipeline.
+As long as the language-model integration can return that structure, the rest of the pipeline stays unchanged.
 
-That keeps backend-specific details isolated:
+That keeps model-transport details isolated:
 
-- CLI argument construction, process spawning, and event parsing stay inside `tryGenerateWithCodexCli()`,
+- VS Code language model request and response handling stay inside `tryGenerateWithVsCodeLm()`,
 - the rest of the system only consumes normalized text plus metadata.
 
 ## Execution Pipeline
@@ -256,7 +251,7 @@ sequenceDiagram
 3. Declared inputs are resolved one by one.
 4. Placeholder values are merged into a flat map.
 5. `promptTemplate` is rendered.
-6. The selected AI backend generates output.
+6. The selected VS Code language model generates output.
 7. The extension writes the user-facing output markdown, a reasoning sidecar, and a metadata sidecar.
 8. Follow-up actions are derived from workflow metadata and current context.
 
@@ -307,7 +302,7 @@ Prompt rendering
 
 - isolates template expansion from context collection and model execution.
 
-Backend adapters
+VS Code language model integration
 
 - isolate model-specific transport details from workflow behavior.
 
@@ -359,16 +354,6 @@ Place it in:
 - or workspace override: `<repo>/.cmsis-dev/workflows/`.
 
 No `package.json` command wiring is required. The action appears automatically after reload or refresh.
-
-### Add a new AI model or agent
-
-Add a new backend adapter beside `tryGenerateWithCodexCli()` that:
-
-- accepts a rendered prompt,
-- returns normalized generated text,
-- reports agent and model names.
-
-The rest of the pipeline does not need to change if the adapter conforms to the current generated-output contract.
 
 ### Add a new context source
 

@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=../workflow.schema.json
+id: plan-next-steps
+title: Plan Next Steps
+description: Use a previous CMSIS-Dev run to start an interactive follow-up plan in chat.
+type: plan-next-steps
+followUps:
+  - openReasoning
+inputs:
+  - id: sourceRun
+    label: Previous CMSIS-Dev Run
+    type: run-output-context
+    required: true
+promptTemplate: |
+  You are continuing work from a previous CMSIS-Dev result.
+
+  This workflow runs in chat, so produce a response that works well as the start of an interactive follow-up conversation in this workspace.
+
+  Previous workflow: {{sourceWorkflowTitle}} ({{sourceWorkflowId}})
+  Previous output file: {{sourceOutputFile}}
+
+  Previous CMSIS-Dev output:
+  {{sourceOutput}}
+
+  Produce:
+  1. Actionable takeaways worth following up
+  2. Recommended scope for the next iteration
+  3. A concrete ordered plan to implement or investigate
+  4. The first practical step to take in this workspace
+  5. Any clarifying questions, dependencies, or risks that should be resolved before editing
+
+  Keep the answer concise, concrete, and optimized for an interactive chat follow-up.

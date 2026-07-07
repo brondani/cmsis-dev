@@ -1,7 +1,7 @@
 export interface WorkflowInputDefinition {
   id: string;
   label: string;
-  type?: "text" | "github-pr-context" | "github-issue-context" | "git-local-changes-context";
+  type?: "text" | "github-pr-context" | "github-issue-context" | "git-local-changes-context" | "run-output-context";
   placeholder?: string;
   required?: boolean;
 }
@@ -11,9 +11,7 @@ export type WorkflowFollowUp =
   | "openPr"
   | "openIssue"
   | "postComment"
-  | "submitPr"
-  | "openChat"
-  | "openCodexChat";
+  | "submitPr";
 
 export interface WorkflowDefinition {
   id: string;
@@ -22,8 +20,6 @@ export interface WorkflowDefinition {
   type: "review-pr" | string;
   inputs: WorkflowInputDefinition[];
   promptTemplate?: string;
-  openChatPromptTemplate?: string;
-  openCodexChatPromptTemplate?: string;
   followUps?: WorkflowFollowUp[];
 }
 

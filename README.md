@@ -18,7 +18,7 @@ CMSIS-Dev is a basic VS Code extension scaffold that provides:
 4. Optional inputs let you add relevant code, logs, and architecture context directly from the workflow definition.
 5. The extension builds a structured explanation prompt aimed at onboarding a developer to the issue.
 6. The result is saved using the same output and reasoning flow as other workflows.
-7. You can hand the explanation off to VS Code Chat with **Open in Chat**, which best-effort opens chat and copies a starter prompt to the clipboard for `@cmsisdev`.
+7. The result is saved using the same output and reasoning flow as other workflows.
 
 ## Implemented MVP flow: Review Changes
 
@@ -27,7 +27,7 @@ CMSIS-Dev is a basic VS Code extension scaffold that provides:
 3. The extension resolves the repository's default branch from local git refs and compares the local working tree against that branch head.
 4. It collects tracked-file diffs plus untracked file contents and builds a review prompt similar to **Review PR**.
 5. The result is saved using the same output and reasoning flow as other workflows.
-6. You can hand the review off to VS Code Chat with **Open in Chat**, which best-effort opens chat and copies a starter prompt to the clipboard for `@cmsisdev`.
+6. The result is saved using the same output and reasoning flow as other workflows.
 
 ## Implemented MVP flow: Create PR
 
@@ -47,13 +47,13 @@ CMSIS-Dev is a basic VS Code extension scaffold that provides:
 3. The extension fetches PR metadata + changed files from GitHub API.
 4. It builds a detailed review prompt for code review.
 5. It shows progress in the status bar during selection, fetch, generation, and save phases.
-6. The extension runs the workflow through the selected AI backend. By default this is VS Code's language model system and the configured chat model.
+6. The extension runs the workflow through VS Code's language model system and the configured chat model.
 7. Output files are saved only after the review text has actually been generated.
 8. The review draft is saved to `.cmsis-dev/runs/...md` and copied to clipboard.
-9. A reasoning log (prompt, metadata, generated output, latest backend event) is written as a persistent sidecar markdown file and can be opened from the completion notification.
+9. A reasoning log (prompt, metadata, and generated output) is written as a persistent sidecar markdown file and can be opened from the completion notification.
 10. From the completion notification, you can directly **Post Comment** to the PR thread (requires a stored GitHub token and generated review output).
 11. You can also open the PR page and paste the draft manually if preferred.
-12. You can hand the review off to VS Code Chat with **Open in Chat**, which best-effort opens chat and copies a starter prompt to the clipboard for `@cmsisdev`.
+12. The review result is saved to the runs directory and can be opened from the `Runs` view.
 
 For generic action outputs in `.cmsis-dev/runs`, when PR context is used the filename includes the PR number (for example `review-pr-pr-123-<timestamp>.md`).
 Persistent sidecar files are also written:
@@ -73,7 +73,6 @@ These enable persistent actions even after notifications disappear.
 - Use `CMSIS-Dev: Create Workflow Overrides` to scaffold editable workspace copies when needed.
 - Add a new workspace `.yml` file under `.cmsis-dev/workflows/`, refresh the view, and run it from the AI Actions tree.
 - Generic workflows run by collecting declared inputs and rendering `promptTemplate`.
-- `openChatPromptTemplate` can be used to define the starter prompt for the `Open in Chat` follow-up directly in the workflow YAML. `openCodexChatPromptTemplate` is still accepted for compatibility.
 - Reusable input types include:
   - `text`: prompts the user for a value.
   - `github-pr-context`: fetches PR metadata and changed-file patches and injects placeholders.
@@ -136,7 +135,6 @@ Use VS Code SecretStorage commands (no plaintext settings):
 - `CMSIS-Dev: Clear GitHub Token`
 - `CMSIS-Dev: Open Reasoning`
 - `CMSIS-Dev: Post Comment`
-- `CMSIS-Dev: Open in Chat`
 - `CMSIS-Dev: Submit PR`
 
 ## Configure
@@ -144,13 +142,10 @@ Use VS Code SecretStorage commands (no plaintext settings):
 Settings:
 
 - `cmsisDev.workflowConfigPath`: workspace workflow override file or directory path (default `.cmsis-dev/workflows`).
-- `cmsisDev.aiBackend`: choose `vscodeLm` or `codexCli` (default `vscodeLm`).
 - `cmsisDev.languageModelSelector`: optional VS Code language model selector saved by the `CMSIS-Dev: Set VS Code Model` command.
 - `cmsisDev.languageModelProvider.baseUrl`: OpenAI-compatible `v1` base URL used by the built-in CMSIS-Dev model provider.
-- `cmsisDev.codexModel`: optional Codex model override when `cmsisDev.aiBackend` is `codexCli`.
-- `cmsisDev.codexReasoningEffort`: optional Codex reasoning effort override when `cmsisDev.aiBackend` is `codexCli`.
 
-The `Actions` view title shows the effective AI backend and model selection, and provides toolbar actions to change both without opening settings.
+The `Actions` view title shows the effective model selection and provides toolbar actions to change it without opening settings.
 
 Provider setup:
 
@@ -207,6 +202,5 @@ Supported workflow input types for MCP exposure:
 
 ## Notes
 
-- Workflow behavior is primarily driven by the bundled workflow files, with optional workspace overrides in `.cmsis-dev/workflows/*.yml`, including action prompts and the `Open in Chat` starter prompt.
+- Workflow behavior is primarily driven by the bundled workflow files, with optional workspace overrides in `.cmsis-dev/workflows/*.yml`.
 - The MCP server exposes tools dynamically from the workflow config, but only for workflow input types it currently knows how to resolve: `text`, `github-pr-context`, `github-issue-context`, and `git-local-changes-context`.
-- The chat handoff is still best-effort: the extension can open/focus VS Code Chat and copy the starter prompt to the clipboard, but it does not programmatically paste or send the chat message.

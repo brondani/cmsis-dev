@@ -7,14 +7,6 @@ followUps:
   - openReasoning
   - openPr
   - postComment
-  - openChat
-openChatPromptTemplate: |
-  Use the CMSIS-Dev reasoning file as the source of truth.
-  If it is not already attached in chat, add it before you send this prompt.
-  It contains the generated review plus the workflow context that produced it.
-  Identify the concrete review suggestions worth implementing in this workspace.
-  Start with a short plan, then implement the accepted changes.
-  If any finding is unclear, unsupported, or too risky, explain that before editing.
 inputs:
   - id: pr
     label: Pull Request

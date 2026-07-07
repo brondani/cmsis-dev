@@ -3,11 +3,13 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { getConfiguredAiBackend, resolveConfiguredLanguageModel, formatLanguageModelLabel } from "../aiSettings";
+import { formatLanguageModelLabel, formatLanguageModelSelector, getConfiguredLanguageModelSelector, resolveConfiguredLanguageModel } from "../aiSettings";
 import {
-  resolveEffectiveCodexModel,
-  resolveEffectiveCodexReasoningEffort
-} from "../codexSettings";
+  buildReasoningModelOptions,
+  CmsisDevReasoningEffort,
+  formatReasoningEffortLabel,
+  getConfiguredReasoningEffort
+} from "../reasoningEffort";
 import {
   createPullRequest,
   getIssue,
@@ -32,10 +34,11 @@ import {
 } from "../types";
 import { resolveWorkflowRunsDirUri } from "../workflowConfig";
 
-type ReviewEngine = "codexCli" | "vscodeLm";
+type ReviewEngine = "vscodeLm";
 
 export interface PromptWorkflowOptions {
   onStatus?: (status: string) => void;
+  presetRunOutputUri?: vscode.Uri;
 }
 
 export interface PromptWorkflowResult {
@@ -94,9 +97,8 @@ interface ActionOutputMetadata {
   workflowId: string;
   workflowTitle: string;
   followUps: WorkflowFollowUp[];
-  openChatPrompt?: string;
-  openCodexChatPrompt?: string;
   pullRequestDraft?: PullRequestDraft;
+  reasoningEffort?: CmsisDevReasoningEffort;
   engine: ReviewEngine;
   agentName: string;
   modelName: string;
@@ -110,8 +112,13 @@ interface ActionOutputMetadata {
   localChangesContext?: SelectedLocalChangesContext;
 }
 
+interface SelectedRunOutputContext {
+  outputFile: vscode.Uri;
+  outputText: string;
+  metadata: ActionOutputMetadata;
+}
+
 interface GenerationOptions {
-  onEvent?: (event: Record<string, unknown>) => void | Promise<void>;
   onStatus?: (status: string) => void;
   model?: vscode.LanguageModelChat;
 }
@@ -120,6 +127,7 @@ export interface PromptWorkflowChatOptions {
   additionalInstructions?: string;
   model: vscode.LanguageModelChat;
   onStatus?: (status: string) => void;
+  presetRunOutputUri?: vscode.Uri;
 }
 
 export interface ActiveOutputFollowUpState {
@@ -128,33 +136,20 @@ export interface ActiveOutputFollowUpState {
   canOpenIssue: boolean;
   canPostComment: boolean;
   canSubmitPr: boolean;
-  canOpenChat: boolean;
-  canOpenCodexChat: boolean;
 }
 
 const DEFAULT_OUTPUT_FOLLOW_UPS: WorkflowFollowUp[] = ["openReasoning"];
-const LEGACY_PR_OUTPUT_FOLLOW_UPS: WorkflowFollowUp[] = ["openReasoning", "openPr", "postComment", "openChat"];
+const LEGACY_PR_OUTPUT_FOLLOW_UPS: WorkflowFollowUp[] = ["openReasoning", "openPr", "postComment"];
 const LEGACY_CREATE_PR_OUTPUT_FOLLOW_UPS: WorkflowFollowUp[] = ["openReasoning", "submitPr"];
-const LEGACY_REVIEW_LOCAL_OUTPUT_FOLLOW_UPS: WorkflowFollowUp[] = ["openReasoning", "openChat"];
-const LEGACY_ISSUE_OUTPUT_FOLLOW_UPS: WorkflowFollowUp[] = ["openReasoning", "openIssue", "openChat"];
+const LEGACY_REVIEW_LOCAL_OUTPUT_FOLLOW_UPS: WorkflowFollowUp[] = ["openReasoning"];
+const LEGACY_ISSUE_OUTPUT_FOLLOW_UPS: WorkflowFollowUp[] = ["openReasoning", "openIssue"];
 const EMPTY_ACTIVE_OUTPUT_FOLLOW_UP_STATE: ActiveOutputFollowUpState = {
   canOpenReasoning: false,
   canOpenPr: false,
   canOpenIssue: false,
   canPostComment: false,
-  canSubmitPr: false,
-  canOpenChat: false,
-  canOpenCodexChat: false
+  canSubmitPr: false
 };
-
-const CHAT_FOCUS_COMMANDS = ["workbench.panel.chat.view.copilot.focus", "workbench.action.chat.open"];
-const CHAT_NEW_THREAD_COMMANDS = ["workbench.action.chat.new", "workbench.action.chat.open"];
-
-interface ChatLaunchResult {
-  focused: boolean;
-  createdThread: boolean;
-  commands: string[];
-}
 
 export async function runPromptWorkflow(
   workflow: WorkflowDefinition,
@@ -172,7 +167,9 @@ export async function runPromptWorkflow(
     throw new Error(`Missing promptTemplate in workflow '${workflow.id}'.`);
   }
 
-  const resolved = await collectInputValues(workflow, token);
+  const resolved = await collectInputValues(workflow, token, {
+    presetRunOutputUri: options.presetRunOutputUri
+  });
   if (!resolved) {
     return {
       generated: false,
@@ -189,6 +186,7 @@ export async function runPromptWorkflow(
   void vscode.commands.executeCommand("cmsisDev.refreshRuns");
 
   await vscode.env.clipboard.writeText(output);
+  reportStatus(`${workflow.title} output saved`);
 
   const followUpState = getActiveOutputFollowUpStateFromMetadata(metadata);
   const actions: string[] = [];
@@ -201,16 +199,10 @@ export async function runPromptWorkflow(
   if (followUpState.canOpenIssue) {
     actions.push("Open Issue");
   }
-  if (followUpState.canOpenChat) {
-    actions.push("Open in Chat");
-  }
   if (followUpState.canSubmitPr) {
     actions.push("Submit PR");
   }
   actions.push("Open Output");
-  if (followUpState.canOpenReasoning) {
-    actions.push("Open Reasoning");
-  }
 
   const action = await vscode.window.showInformationMessage(
     `AI action output copied and saved. Reasoning: ${reasoningFile.fsPath}`,
@@ -234,16 +226,8 @@ export async function runPromptWorkflow(
     await vscode.window.showTextDocument(doc, { preview: false });
   }
 
-  if (action === "Open in Chat") {
-    await openChatFromMetadata(metadata);
-  }
-
   if (action === "Submit PR") {
     await submitPullRequestFromMetadata(metadata);
-  }
-
-  if (action === "Open Reasoning") {
-    await openReasoningFile(reasoningFile.fsPath);
   }
 
   return {
@@ -263,16 +247,22 @@ export async function runPromptWorkflowInChat(
 
   reportStatus(`Collecting inputs for ${workflow.title}`);
   const token = await getGitHubToken();
-  const resolved = await collectInputValues(workflow, token);
+  const resolved = await collectInputValues(workflow, token, {
+    presetRunOutputUri: options.presetRunOutputUri
+  });
   if (!resolved) {
     return undefined;
   }
 
-  return executeWorkflowGeneration(workflow, resolved, {
+  const execution = await executeWorkflowGeneration(workflow, resolved, {
     additionalInstructions: options.additionalInstructions,
     model: options.model,
     onStatus: reportStatus
   });
+  await writeOutputMetadata(execution.outputFile, execution.metadata);
+  void vscode.commands.executeCommand("cmsisDev.refreshRuns");
+  reportStatus(`${workflow.title} output saved`);
+  return execution;
 }
 
 async function executeWorkflowGeneration(
@@ -291,10 +281,9 @@ async function executeWorkflowGeneration(
 
   options.onStatus?.(`Preparing prompt for ${workflow.title}`);
   const prompt = buildWorkflowPrompt(promptTemplate, resolved.values, options.additionalInstructions);
-  const openChatPromptTemplate = workflow.openChatPromptTemplate?.trim() || workflow.openCodexChatPromptTemplate?.trim();
-  const openChatPrompt = openChatPromptTemplate ? renderPromptTemplate(openChatPromptTemplate, resolved.values) : undefined;
   const followUps = resolveWorkflowFollowUps(workflow);
-  const engine = resolveWorkflowEngine(options.model);
+  const engine: ReviewEngine = "vscodeLm";
+  const reasoningEffort = getConfiguredReasoningEffort();
   let pullRequestDraft: PullRequestDraft | undefined;
 
   const liveReasoningFile = await createTransientReasoningFile();
@@ -305,9 +294,8 @@ async function executeWorkflowGeneration(
     workflowId: workflow.id,
     workflowTitle: workflow.title,
     followUps,
-    openChatPrompt,
-    openCodexChatPrompt: openChatPrompt,
     pullRequestDraft,
+    reasoningEffort,
     engine,
     prompt,
     inputValues: resolved.values,
@@ -319,19 +307,13 @@ async function executeWorkflowGeneration(
   };
   await updateReasoningFile(liveReasoningFile, liveReasoningPayload);
 
-  liveReasoningPayload.phase = engine === "codexCli" ? "codex-cli" : "vscode-lm";
+  liveReasoningPayload.phase = "vscode-lm";
   await updateReasoningFile(liveReasoningFile, liveReasoningPayload);
-  options.onStatus?.(
-    engine === "codexCli" ? `Generating ${workflow.title} with Codex CLI` : `Generating ${workflow.title} with the selected chat model`
-  );
+  options.onStatus?.(`Generating ${workflow.title} with the selected chat model`);
 
-  const generated = await generateWithConfiguredBackend(prompt, {
+  const generated = await generateWithLanguageModel(prompt, {
     model: options.model,
-    onStatus: options.onStatus,
-    onEvent: async (event) => {
-      liveReasoningPayload.backendEvent = event;
-      await updateReasoningFile(liveReasoningFile, liveReasoningPayload);
-    }
+    onStatus: options.onStatus
   });
 
   if (!generated) {
@@ -350,7 +332,8 @@ async function executeWorkflowGeneration(
       : generated.content,
     {
       agentName: generated.agentName,
-      modelName: generated.modelName
+      modelName: generated.modelName,
+      reasoningEffort
     }
   );
   const outputFile = await writeOutputFile(
@@ -367,9 +350,8 @@ async function executeWorkflowGeneration(
     workflowId: workflow.id,
     workflowTitle: workflow.title,
     followUps,
-    openChatPrompt,
-    openCodexChatPrompt: openChatPrompt,
     pullRequestDraft,
+    reasoningEffort,
     engine,
     agentName: generated.agentName,
     modelName: generated.modelName,
@@ -391,9 +373,8 @@ async function executeWorkflowGeneration(
     workflowId: workflow.id,
     workflowTitle: workflow.title,
     followUps,
-    openChatPrompt,
-    openCodexChatPrompt: openChatPrompt,
     pullRequestDraft,
+    reasoningEffort,
     engine,
     agentName: generated.agentName,
     modelName: generated.modelName,
@@ -429,6 +410,20 @@ export async function openReasoningForActiveOutput(): Promise<void> {
   await openReasoningFile(metadata.reasoningFile);
 }
 
+export async function openReasoningForOutputUri(outputUri: vscode.Uri): Promise<void> {
+  const metadata = await getMetadataForOutputUri(outputUri, "No action metadata found for this run output.");
+  if (!metadata) {
+    return;
+  }
+
+  if (!getActiveOutputFollowUpStateFromMetadata(metadata).canOpenReasoning) {
+    vscode.window.showWarningMessage("Open Reasoning is not available for this run output.");
+    return;
+  }
+
+  await openReasoningFile(metadata.reasoningFile);
+}
+
 export async function postCommentForActiveOutput(): Promise<void> {
   const metadata = await getMetadataForActiveOutput();
   if (!metadata) {
@@ -437,6 +432,20 @@ export async function postCommentForActiveOutput(): Promise<void> {
 
   if (!getActiveOutputFollowUpStateFromMetadata(metadata).canPostComment) {
     vscode.window.showWarningMessage("Post Comment is not available for the active output file.");
+    return;
+  }
+
+  await postCommentFromMetadata(metadata);
+}
+
+export async function postCommentForOutputUri(outputUri: vscode.Uri): Promise<void> {
+  const metadata = await getMetadataForOutputUri(outputUri, "No action metadata found for this run output.");
+  if (!metadata) {
+    return;
+  }
+
+  if (!getActiveOutputFollowUpStateFromMetadata(metadata).canPostComment) {
+    vscode.window.showWarningMessage("Post Comment is not available for this run output.");
     return;
   }
 
@@ -463,6 +472,26 @@ export async function openPrForActiveOutput(): Promise<void> {
   await vscode.env.openExternal(vscode.Uri.parse(prUrl));
 }
 
+export async function openPrForOutputUri(outputUri: vscode.Uri): Promise<void> {
+  const metadata = await getMetadataForOutputUri(outputUri, "No action metadata found for this run output.");
+  if (!metadata) {
+    return;
+  }
+
+  if (!getActiveOutputFollowUpStateFromMetadata(metadata).canOpenPr) {
+    vscode.window.showWarningMessage("Open PR is not available for this run output.");
+    return;
+  }
+
+  const prUrl = metadata.prContext?.pr.htmlUrl;
+  if (!prUrl) {
+    vscode.window.showWarningMessage("No PR context URL found for this run output.");
+    return;
+  }
+
+  await vscode.env.openExternal(vscode.Uri.parse(prUrl));
+}
+
 export async function openIssueForActiveOutput(): Promise<void> {
   const metadata = await getMetadataForActiveOutput();
   if (!metadata) {
@@ -483,6 +512,26 @@ export async function openIssueForActiveOutput(): Promise<void> {
   await vscode.env.openExternal(vscode.Uri.parse(issueUrl));
 }
 
+export async function openIssueForOutputUri(outputUri: vscode.Uri): Promise<void> {
+  const metadata = await getMetadataForOutputUri(outputUri, "No action metadata found for this run output.");
+  if (!metadata) {
+    return;
+  }
+
+  if (!getActiveOutputFollowUpStateFromMetadata(metadata).canOpenIssue) {
+    vscode.window.showWarningMessage("Open Issue is not available for this run output.");
+    return;
+  }
+
+  const issueUrl = metadata.issueContext?.issue.htmlUrl;
+  if (!issueUrl) {
+    vscode.window.showWarningMessage("No issue context URL found for this run output.");
+    return;
+  }
+
+  await vscode.env.openExternal(vscode.Uri.parse(issueUrl));
+}
+
 export async function submitPrForActiveOutput(): Promise<void> {
   const metadata = await getMetadataForActiveOutput();
   if (!metadata) {
@@ -497,22 +546,18 @@ export async function submitPrForActiveOutput(): Promise<void> {
   await submitPullRequestFromMetadata(metadata);
 }
 
-export async function openChatForActiveOutput(): Promise<void> {
-  const metadata = await getMetadataForActiveOutput();
+export async function submitPrForOutputUri(outputUri: vscode.Uri): Promise<void> {
+  const metadata = await getMetadataForOutputUri(outputUri, "No action metadata found for this run output.");
   if (!metadata) {
     return;
   }
 
-  if (!getActiveOutputFollowUpStateFromMetadata(metadata).canOpenChat) {
-    vscode.window.showWarningMessage("Open in Chat is not available for the active output file.");
+  if (!getActiveOutputFollowUpStateFromMetadata(metadata).canSubmitPr) {
+    vscode.window.showWarningMessage("Submit PR is not available for this run output.");
     return;
   }
 
-  await openChatFromMetadata(metadata);
-}
-
-export async function openCodexChatForActiveOutput(): Promise<void> {
-  await openChatForActiveOutput();
+  await submitPullRequestFromMetadata(metadata);
 }
 
 export async function getActiveOutputFollowUpState(
@@ -527,32 +572,21 @@ export async function getActiveOutputFollowUpState(
   return metadata ? getActiveOutputFollowUpStateFromMetadata(metadata) : EMPTY_ACTIVE_OUTPUT_FOLLOW_UP_STATE;
 }
 
-async function openChatFromMetadata(metadata: ActionOutputMetadata): Promise<void> {
-  const starterPrompt = buildChatStarterPrompt(metadata);
-  if (!starterPrompt) {
-    vscode.window.showWarningMessage("No chat starter prompt is available for this output file.");
-    return;
-  }
-
-  const launchResult = await openNewChatBestEffort();
-  await vscode.env.clipboard.writeText(starterPrompt);
-
-  const statusParts: string[] = [];
-  if (launchResult.createdThread) {
-    statusParts.push("Opened a fresh chat thread.");
-  } else if (launchResult.focused) {
-    statusParts.push("Focused the chat view, but could not create a fresh thread automatically.");
-  } else {
-    statusParts.push("Could not open the chat view automatically.");
-  }
-  statusParts.push("Starter prompt copied to clipboard. Use `@cmsisdev`, then paste it in chat. Add the reasoning file first if the prompt asks for it.");
-  await vscode.window.showInformationMessage(statusParts.join(" "));
+export async function getOutputFollowUpStateForUri(outputUri: vscode.Uri): Promise<ActiveOutputFollowUpState> {
+  const metadata = await getMetadataForOutputUri(outputUri);
+  return metadata ? getActiveOutputFollowUpStateFromMetadata(metadata) : EMPTY_ACTIVE_OUTPUT_FOLLOW_UP_STATE;
 }
 
 async function postCommentFromMetadata(metadata: ActionOutputMetadata): Promise<void> {
   const token = await getGitHubToken();
   if (!token) {
-    vscode.window.showWarningMessage("Cannot post comment without a GitHub token. Run 'CMSIS-Dev: Set GitHub Token'.");
+    const selection = await vscode.window.showWarningMessage(
+      "Cannot post comment without a GitHub token.",
+      "Configure Integrations"
+    );
+    if (selection === "Configure Integrations") {
+      await vscode.commands.executeCommand("cmsisDev.configureIntegrations");
+    }
     return;
   }
 
@@ -592,7 +626,13 @@ async function postCommentFromMetadata(metadata: ActionOutputMetadata): Promise<
 async function submitPullRequestFromMetadata(metadata: ActionOutputMetadata): Promise<void> {
   const token = await getGitHubToken();
   if (!token) {
-    vscode.window.showWarningMessage("Cannot submit a PR without a GitHub token. Run 'CMSIS-Dev: Set GitHub Token'.");
+    const selection = await vscode.window.showWarningMessage(
+      "Cannot submit a PR without a GitHub token.",
+      "Configure Integrations"
+    );
+    if (selection === "Configure Integrations") {
+      await vscode.commands.executeCommand("cmsisDev.configureIntegrations");
+    }
     return;
   }
 
@@ -705,12 +745,34 @@ async function getMetadataForActiveOutput(): Promise<ActionOutputMetadata | unde
   return metadata;
 }
 
+async function getMetadataForOutputUri(
+  outputUri: vscode.Uri,
+  missingMetadataMessage?: string
+): Promise<ActionOutputMetadata | undefined> {
+  if (outputUri.scheme !== "file") {
+    return undefined;
+  }
+
+  const metadata = await readOutputMetadata(outputUri);
+  if (!metadata && missingMetadataMessage) {
+    vscode.window.showWarningMessage(missingMetadataMessage);
+  }
+
+  return metadata;
+}
+
 async function openReasoningFile(reasoningFilePath: string): Promise<void> {
   const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(reasoningFilePath));
   await vscode.window.showTextDocument(doc, { preview: false });
 }
 
-async function collectInputValues(workflow: WorkflowDefinition, token?: string): Promise<ResolvedInputs | undefined> {
+async function collectInputValues(
+  workflow: WorkflowDefinition,
+  token?: string,
+  options: {
+    presetRunOutputUri?: vscode.Uri;
+  } = {}
+): Promise<ResolvedInputs | undefined> {
   const values: Record<string, string> = {};
   let prContext: SelectedPrContext | undefined;
   let issueContext: SelectedIssueContext | undefined;
@@ -810,6 +872,27 @@ async function collectInputValues(workflow: WorkflowDefinition, token?: string):
       values.linkedPrs ??= formatSimpleList(references.linkedPullRequests, "(No linked pull requests found)");
       values.relatedIssues ??= formatSimpleList(references.relatedIssues, "(No related issues found)");
       values.issueUrl ??= selected.issue.htmlUrl;
+      continue;
+    }
+
+    if (input.type === "run-output-context") {
+      const selected = await selectRunOutputContext(workflow, input, options.presetRunOutputUri);
+      if (!selected) {
+        return undefined;
+      }
+
+      values[input.id] = selected.outputFile.fsPath;
+      values[`${input.id}_workflowId`] = selected.metadata.workflowId;
+      values[`${input.id}_workflowTitle`] = selected.metadata.workflowTitle;
+      values[`${input.id}_outputFile`] = selected.metadata.outputFile;
+      values[`${input.id}_reasoningFile`] = selected.metadata.reasoningFile;
+      values[`${input.id}_output`] = selected.outputText;
+
+      values.sourceWorkflowId ??= selected.metadata.workflowId;
+      values.sourceWorkflowTitle ??= selected.metadata.workflowTitle;
+      values.sourceOutputFile ??= selected.metadata.outputFile;
+      values.sourceReasoningFile ??= selected.metadata.reasoningFile;
+      values.sourceOutput ??= selected.outputText;
       continue;
     }
 
@@ -1168,6 +1251,109 @@ async function selectLocalChangesContext(input: WorkflowInputDefinition): Promis
   return selected?.repo;
 }
 
+async function selectRunOutputContext(
+  workflow: Pick<WorkflowDefinition, "id" | "title">,
+  input: WorkflowInputDefinition,
+  presetRunOutputUri?: vscode.Uri
+): Promise<SelectedRunOutputContext | undefined> {
+  const runsDirUri = await resolveWorkflowRunsDirUri();
+  if (!runsDirUri || runsDirUri.scheme !== "file") {
+    vscode.window.showWarningMessage("No CMSIS-Dev runs directory is available in this workspace yet.");
+    return undefined;
+  }
+
+  const allowedWorkflowIds = resolveAllowedSourceWorkflowIds(workflow.id);
+
+  if (presetRunOutputUri?.scheme === "file") {
+    const metadata = await readOutputMetadata(presetRunOutputUri);
+    if (!metadata) {
+      vscode.window.showWarningMessage("No action metadata found for the selected run output.");
+      return undefined;
+    }
+
+    if (allowedWorkflowIds && !allowedWorkflowIds.includes(metadata.workflowId)) {
+      vscode.window.showWarningMessage(`'${workflow.title}' cannot use '${metadata.workflowTitle}' as its input.`);
+      return undefined;
+    }
+
+    const outputText = await resolveOutputFileText(metadata);
+    if (!outputText?.trim()) {
+      vscode.window.showWarningMessage("The selected CMSIS-Dev run output could not be read.");
+      return undefined;
+    }
+
+    return {
+      outputFile: presetRunOutputUri,
+      outputText: truncateRunOutputForPrompt(outputText),
+      metadata
+    };
+  }
+
+  let entries: string[] = [];
+  try {
+    entries = (await fs.readdir(runsDirUri.fsPath))
+      .filter((entry) => entry.endsWith(".md") && !entry.endsWith(".reasoning.md"))
+      .sort((left, right) => right.localeCompare(left));
+  } catch {
+    // Keep empty fallback.
+  }
+
+  const candidates: Array<{
+    label: string;
+    description: string;
+    detail: string;
+    outputFile: vscode.Uri;
+    metadata: ActionOutputMetadata;
+  }> = [];
+
+  for (const entry of entries) {
+    const outputFile = vscode.Uri.file(path.join(runsDirUri.fsPath, entry));
+    const metadata = await readOutputMetadata(outputFile);
+    if (!metadata) {
+      continue;
+    }
+    if (allowedWorkflowIds && !allowedWorkflowIds.includes(metadata.workflowId)) {
+      continue;
+    }
+
+    candidates.push({
+      label: formatRunOutputLabel(outputFile.fsPath, metadata),
+      description: metadata.workflowId,
+      detail: outputFile.fsPath,
+      outputFile,
+      metadata
+    });
+  }
+
+  if (candidates.length === 0) {
+    const constraintText = allowedWorkflowIds?.length
+      ? ` compatible with '${workflow.title}'`
+      : "";
+    vscode.window.showWarningMessage(`No previous CMSIS-Dev run outputs${constraintText} were found.`);
+    return undefined;
+  }
+
+  const selected = await vscode.window.showQuickPick(candidates, {
+    title: input.label || "Choose Previous CMSIS-Dev Run",
+    placeHolder: "Select the previous CMSIS-Dev result to use as context"
+  });
+  if (!selected) {
+    return undefined;
+  }
+
+  const outputText = await resolveOutputFileText(selected.metadata);
+  if (!outputText?.trim()) {
+    vscode.window.showWarningMessage("The selected CMSIS-Dev run output could not be read.");
+    return undefined;
+  }
+
+  return {
+    outputFile: selected.outputFile,
+    outputText: truncateRunOutputForPrompt(outputText),
+    metadata: selected.metadata
+  };
+}
+
 async function collectLocalChangesValues(selected: {
   rootPath: string;
   workspaceFolderName: string;
@@ -1181,19 +1367,15 @@ async function collectLocalChangesValues(selected: {
 
   const currentBranch = (await runGitCommand(selected.rootPath, ["branch", "--show-current"])).trim() || "detached HEAD";
   const changedEntries = await getTrackedDiffEntries(selected.rootPath, defaultRef.ref);
-  const untrackedFiles = await getUntrackedFiles(selected.rootPath);
 
-  if (changedEntries.length === 0 && untrackedFiles.length === 0) {
+  if (changedEntries.length === 0) {
     return undefined;
   }
 
-  const fileSections = await formatLocalChangeSections(selected.rootPath, defaultRef.ref, changedEntries, untrackedFiles);
+  const fileSections = await formatLocalChangeSections(selected.rootPath, defaultRef.ref, changedEntries);
   const latestLocalReview = await findLatestLocalReviewSummary(selected.rootPath);
   const pullRequestTemplates = await readPullRequestTemplates(selected.rootPath);
-  const changedFilesList = [
-    ...changedEntries.map((entry) => entry.displayPath),
-    ...untrackedFiles
-  ];
+  const changedFilesList = changedEntries.map((entry) => entry.displayPath);
   const uniqueChangedFiles = Array.from(new Set(changedFilesList));
   const values: Record<string, string> = {
     [inputId]: selected.rootPath,
@@ -1304,6 +1486,55 @@ function formatSimpleList(items: string[], emptyText: string): string {
   }
 
   return items.map((item) => `- ${item}`).join("\n");
+}
+
+function resolveAllowedSourceWorkflowIds(workflowId: string): readonly string[] | undefined {
+  if (workflowId === "plan-next-steps") {
+    return ["review-pr", "review-changes", "explain-issue"];
+  }
+
+  return undefined;
+}
+
+function formatRunOutputLabel(
+  outputPath: string,
+  metadata: Pick<ActionOutputMetadata, "workflowTitle" | "prContext" | "issueContext" | "localChangesContext">
+): string {
+  const workflowTitle = metadata.workflowTitle?.trim();
+  const prNumber = metadata.prContext?.pr.number;
+  if (workflowTitle && typeof prNumber === "number") {
+    return `${workflowTitle} #${prNumber}`;
+  }
+
+  const issueNumber = metadata.issueContext?.issue.number;
+  if (workflowTitle && typeof issueNumber === "number") {
+    return `${workflowTitle} #${issueNumber}`;
+  }
+
+  if (workflowTitle) {
+    const workspaceFolderName = metadata.localChangesContext?.workspaceFolderName?.trim();
+    if (workspaceFolderName) {
+      return `${workflowTitle} ${workspaceFolderName}`;
+    }
+
+    const rootPath = metadata.localChangesContext?.rootPath?.trim();
+    if (rootPath) {
+      return `${workflowTitle} ${path.basename(rootPath)}`;
+    }
+
+    return workflowTitle;
+  }
+
+  return path.basename(outputPath).replace(/-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z(?=\.md$)/, "");
+}
+
+function truncateRunOutputForPrompt(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length <= 12_000) {
+    return trimmed;
+  }
+
+  return `${trimmed.slice(0, 12_000)}\n\n[Truncated by CMSIS-Dev for chat context.]`;
 }
 
 async function readPullRequestTemplates(repoRoot: string): Promise<string> {
@@ -1531,19 +1762,10 @@ async function getTrackedDiffEntries(
     });
 }
 
-async function getUntrackedFiles(repoRoot: string): Promise<string[]> {
-  const raw = await runGitCommand(repoRoot, ["ls-files", "--others", "--exclude-standard"]);
-  return raw
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-}
-
 async function formatLocalChangeSections(
   repoRoot: string,
   defaultRef: string,
-  changedEntries: Array<{ status: string; displayPath: string; pathSpec: string }>,
-  untrackedFiles: string[]
+  changedEntries: Array<{ status: string; displayPath: string; pathSpec: string }>
 ): Promise<string> {
   const trackedSections = await Promise.all(
     changedEntries.map(async (entry) => {
@@ -1555,22 +1777,7 @@ async function formatLocalChangeSections(
     })
   );
 
-  const untrackedSections = await Promise.all(
-    untrackedFiles.map(async (filePath) => {
-      const absolutePath = path.join(repoRoot, filePath);
-      let content = "(Binary or unreadable untracked file)";
-      try {
-        const buffer = await fs.readFile(absolutePath);
-        content = buffer.includes(0) ? "(Binary untracked file)" : buffer.toString("utf8").slice(0, 4000);
-      } catch {
-        // Keep fallback text.
-      }
-
-      return `File: ${filePath}\nStatus: ??\nPatch:\n${content}`;
-    })
-  );
-
-  return [...trackedSections, ...untrackedSections].join("\n\n---\n\n");
+  return trackedSections.join("\n\n---\n\n");
 }
 
 async function runGitCommand(
@@ -1625,158 +1832,38 @@ function buildWorkflowPrompt(template: string, values: Record<string, string>, a
   return [prompt.trimEnd(), "", "Additional user instructions:", extra].join("\n");
 }
 
-function resolveWorkflowEngine(model: vscode.LanguageModelChat | undefined): ReviewEngine {
-  if (model) {
-    return "vscodeLm";
-  }
-
-  return getConfiguredAiBackend();
-}
-
-async function generateWithConfiguredBackend(
+async function generateWithLanguageModel(
   prompt: string,
   options: GenerationOptions = {}
 ): Promise<GeneratedReview | undefined> {
-  const engine = resolveWorkflowEngine(options.model);
-  return engine === "codexCli" ? tryGenerateWithCodexCli(prompt, options) : tryGenerateWithVsCodeLm(prompt, options);
-}
-
-async function tryGenerateWithCodexCli(prompt: string, options: GenerationOptions = {}): Promise<GeneratedReview | undefined> {
-  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-  const cwd = workspaceFolder?.uri.fsPath ?? process.cwd();
-  const cliExecutable =
-    vscode.workspace.getConfiguration("chatgpt").get<string>("cliExecutable")?.trim() || "codex";
-  const configuredModel = await resolveEffectiveCodexModel();
-  const configuredReasoningEffort = await resolveEffectiveCodexReasoningEffort();
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "cmsis-dev-codex-cli-"));
-  const outputPath = path.join(tempDir, "last-message.md");
-
-  return new Promise<GeneratedReview | undefined>((resolve) => {
-    let stdoutBuffer = "";
-    let stderrBuffer = "";
-    let settled = false;
-
-    const finish = async (value: GeneratedReview | undefined): Promise<void> => {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
-      resolve(value);
-    };
-
-    const child = cp.spawn(
-      cliExecutable,
-      [
-        "exec",
-        ...(configuredModel !== "default" ? ["--model", configuredModel] : []),
-        "--config",
-        `model_reasoning_effort="${configuredReasoningEffort}"`,
-        "--json",
-        "--skip-git-repo-check",
-        "--sandbox",
-        "read-only",
-        "--output-last-message",
-        outputPath,
-        "-"
-      ],
-      {
-        cwd,
-        env: process.env,
-        windowsHide: true
-      }
-    );
-
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-
-    const handleStdoutChunk = (chunk: string): void => {
-      stdoutBuffer += chunk;
-      const lines = stdoutBuffer.split(/\r?\n/);
-      stdoutBuffer = lines.pop() ?? "";
-
-      for (const rawLine of lines) {
-        const line = rawLine.trim();
-        if (!line.startsWith("{")) {
-          continue;
-        }
-
-        try {
-          const event = JSON.parse(line) as Record<string, unknown>;
-          void Promise.resolve(options.onEvent?.(event));
-
-          const eventType = typeof event.type === "string" ? event.type : "";
-          if (eventType === "thread.started") {
-            options.onStatus?.("Codex CLI thread started");
-          } else if (eventType === "turn.started") {
-            options.onStatus?.("Codex CLI is reviewing");
-          } else if (eventType === "turn.completed") {
-            options.onStatus?.("Codex CLI completed review");
-          }
-        } catch {
-          // Ignore malformed output lines.
-        }
-      }
-    };
-
-    child.stdout.on("data", handleStdoutChunk);
-    child.stderr.on("data", (chunk: string) => {
-      stderrBuffer += chunk;
-    });
-
-    child.on("error", async () => {
-      await finish(undefined);
-    });
-
-    child.on("close", async (code) => {
-      if (stdoutBuffer.trim().startsWith("{")) {
-        handleStdoutChunk("\n");
-      }
-
-      if (code !== 0) {
-        console.warn(`[CMSIS-Dev] Codex CLI exited with code ${code ?? "unknown"}${stderrBuffer ? `: ${stderrBuffer}` : ""}`);
-        await finish(undefined);
-        return;
-      }
-
-      try {
-        const output = (await fs.readFile(outputPath, "utf8")).trim();
-        await finish(
-          output
-            ? {
-                agentName: "Codex CLI",
-                modelName: configuredModel,
-                content: output
-              }
-            : undefined
-        );
-      } catch {
-        await finish(undefined);
-      }
-    });
-
-    child.stdin.write(prompt);
-    child.stdin.end();
-  });
+  return tryGenerateWithVsCodeLm(prompt, options);
 }
 
 async function tryGenerateWithVsCodeLm(prompt: string, options: GenerationOptions = {}): Promise<GeneratedReview | undefined> {
   const model = options.model ?? (await resolveConfiguredLanguageModel());
   if (!model) {
-    throw new Error(
-      "No VS Code chat model is available for CMSIS-Dev. Configure a provider in the Language Models view or select one in CMSIS-Dev settings."
-    );
+    const selector = getConfiguredLanguageModelSelector();
+    if (selector) {
+      throw new Error(
+        `The configured VS Code chat model is unavailable: ${formatLanguageModelSelector(selector)}. Choose another model in CMSIS-Dev settings.`
+      );
+    }
+
+    throw new Error("No VS Code chat model is available for CMSIS-Dev. Configure a provider in the Language Models view.");
   }
 
   const modelLabel = formatLanguageModelLabel(model);
-  options.onStatus?.(`Requesting ${modelLabel}`);
+  const reasoningEffort = getConfiguredReasoningEffort();
+  options.onStatus?.(
+    reasoningEffort ? `Requesting ${modelLabel} | ${formatReasoningEffortLabel(reasoningEffort)}` : `Requesting ${modelLabel}`
+  );
 
   try {
     const response = await model.sendRequest(
       [vscode.LanguageModelChatMessage.User(prompt)],
       {
-        justification: "CMSIS-Dev needs a language model to run repository workflows such as reviews, issue explanations, and PR drafts."
+        justification: "CMSIS-Dev needs a language model to run repository workflows such as reviews, issue explanations, and PR drafts.",
+        modelOptions: buildReasoningModelOptions(reasoningEffort)
       }
     );
 
@@ -1846,7 +1933,7 @@ async function writeOutputFile(
   const runsDirUri = await resolveWorkflowRunsDirUri(true);
   const targetDir = runsDirUri?.scheme === "file" ? runsDirUri.fsPath : path.join(workspaceFolder.uri.fsPath, ".cmsis-dev", "runs");
   await fs.mkdir(targetDir, { recursive: true });
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const timestamp = formatCompactTimestamp(new Date());
   const contextSegment = prContext
     ? `-${prContext.pr.number}`
     : issueContext
@@ -1857,6 +1944,16 @@ async function writeOutputFile(
   const targetFile = path.join(targetDir, `${workflowId}${contextSegment}-${timestamp}.md`);
   await fs.writeFile(targetFile, content, "utf8");
   return vscode.Uri.file(targetFile);
+}
+
+function formatCompactTimestamp(value: Date): string {
+  const year = value.getUTCFullYear();
+  const month = String(value.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(value.getUTCDate()).padStart(2, "0");
+  const hours = String(value.getUTCHours()).padStart(2, "0");
+  const minutes = String(value.getUTCMinutes()).padStart(2, "0");
+  const seconds = String(value.getUTCSeconds()).padStart(2, "0");
+  return `${year}${month}${day}_${hours}${minutes}${seconds}Z`;
 }
 
 async function writeReasoningFile(outputFile: vscode.Uri, payload: Record<string, unknown>): Promise<vscode.Uri> {
@@ -1956,14 +2053,8 @@ function resolveWorkflowFollowUps(workflow: Pick<WorkflowDefinition, "id" | "typ
 }
 
 function normalizeFollowUps(followUps: readonly WorkflowFollowUp[] | undefined): WorkflowFollowUp[] {
-  const allowed = new Set<WorkflowFollowUp>(["openReasoning", "openPr", "openIssue", "postComment", "submitPr", "openChat", "openCodexChat"]);
-  return Array.from(
-    new Set(
-      (followUps ?? [])
-        .filter((followUp) => allowed.has(followUp))
-        .map((followUp) => (followUp === "openCodexChat" ? "openChat" : followUp))
-    )
-  ) as WorkflowFollowUp[];
+  const allowed = new Set<WorkflowFollowUp>(["openReasoning", "openPr", "openIssue", "postComment", "submitPr"]);
+  return Array.from(new Set((followUps ?? []).filter((followUp) => allowed.has(followUp)))) as WorkflowFollowUp[];
 }
 
 function resolveMetadataFollowUps(
@@ -1995,10 +2086,6 @@ function resolveMetadataFollowUps(
 
 function getActiveOutputFollowUpStateFromMetadata(metadata: ActionOutputMetadata): ActiveOutputFollowUpState {
   const followUps = resolveMetadataFollowUps(metadata);
-  const canOpenChat =
-    followUps.includes("openChat") &&
-    Boolean(metadata.reasoningFile || metadata.outputFile) &&
-    Boolean(buildChatStarterPrompt(metadata));
   return {
     canOpenReasoning: followUps.includes("openReasoning") && Boolean(metadata.reasoningFile),
     canOpenPr: followUps.includes("openPr") && Boolean(metadata.prContext?.pr.htmlUrl),
@@ -2009,58 +2096,8 @@ function getActiveOutputFollowUpStateFromMetadata(metadata: ActionOutputMetadata
       Boolean(metadata.outputFile) &&
       Boolean(metadata.localChangesContext?.rootPath) &&
       Boolean(metadata.localChangesContext?.owner) &&
-      Boolean(metadata.localChangesContext?.repo),
-    canOpenChat,
-    canOpenCodexChat: canOpenChat
+      Boolean(metadata.localChangesContext?.repo)
   };
-}
-
-function buildChatStarterPrompt(metadata: ActionOutputMetadata): string | undefined {
-  const configuredPrompt = metadata.openChatPrompt?.trim() || metadata.openCodexChatPrompt?.trim();
-  if (configuredPrompt) {
-    return appendWorkflowFileContext(appendWorkspaceRepoContext(configuredPrompt, metadata), metadata);
-  }
-
-  if (
-    metadata.workflowId === "review-pr" ||
-    metadata.workflowId === "review-changes" ||
-    metadata.prContext ||
-    (metadata.localChangesContext && !metadata.pullRequestDraft)
-  ) {
-    return appendWorkflowFileContext(
-      appendWorkspaceRepoContext(
-      [
-        "Use the CMSIS-Dev reasoning file as the source of truth.",
-        "If it is not already attached in chat, add it before you send this prompt.",
-        "It contains the generated review plus the workflow context that produced it.",
-        "Identify the concrete review suggestions worth implementing in this workspace.",
-        "Start with a short plan, then implement the accepted changes.",
-        "If any finding is unclear, unsupported, or too risky, explain that before editing."
-      ].join("\n"),
-      metadata
-      ),
-      metadata
-    );
-  }
-
-  if (metadata.workflowId === "explain-issue" || metadata.issueContext) {
-    return appendWorkflowFileContext(
-      appendWorkspaceRepoContext(
-      [
-        "Use the CMSIS-Dev reasoning file as context.",
-        "If it is not already attached in chat, add it before you send this prompt.",
-        "It contains the generated issue explanation plus the workflow context that produced it.",
-        "Ask the smallest set of concrete follow-up questions needed to resolve the open questions or missing information.",
-        "Group related questions together and avoid repeating facts already established in the reasoning file.",
-        "If some missing information can be inferred from the local repo, investigate that first before asking."
-      ].join("\n"),
-      metadata
-      ),
-      metadata
-    );
-  }
-
-  return undefined;
 }
 
 async function resolveWorkspaceRepoForRemote(
@@ -2104,99 +2141,6 @@ async function resolveWorkspaceRepoForRemote(
   };
 }
 
-function appendWorkspaceRepoContext(prompt: string, metadata: ActionOutputMetadata): string {
-  const repoRoot =
-    metadata.localChangesContext?.rootPath ?? metadata.prContext?.rootPath ?? metadata.issueContext?.rootPath;
-  const workspaceFolderName =
-    metadata.localChangesContext?.workspaceFolderName ??
-    metadata.prContext?.workspaceFolderName ??
-    metadata.issueContext?.workspaceFolderName;
-
-  if (!repoRoot) {
-    return prompt;
-  }
-
-  const lines = [prompt.trimEnd(), "", "Local workspace repo for this workflow:"];
-  if (workspaceFolderName) {
-    lines.push(`- Workspace folder: ${workspaceFolderName}`);
-  }
-  lines.push(`- Repo root: ${repoRoot}`);
-  lines.push("- Paths mentioned in the CMSIS-Dev reasoning file are relative to this repo root.");
-  return lines.join("\n");
-}
-
-function appendWorkflowFileContext(prompt: string, metadata: ActionOutputMetadata): string {
-  const reasoningFile = metadata.reasoningFile?.trim();
-  const outputFile = metadata.outputFile?.trim();
-  if (!reasoningFile && !outputFile) {
-    return prompt;
-  }
-
-  const lines = [prompt.trimEnd(), "", "Relevant CMSIS-Dev files:"];
-  if (reasoningFile) {
-    lines.push(`- Reasoning file: ${reasoningFile}`);
-  }
-  if (outputFile) {
-    lines.push(`- Output file: ${outputFile}`);
-  }
-
-  return lines.join("\n");
-}
-
-async function openNewChatBestEffort(): Promise<ChatLaunchResult> {
-  const availableCommands = new Set(await vscode.commands.getCommands(true));
-  const result: ChatLaunchResult = {
-    focused: false,
-    createdThread: false,
-    commands: []
-  };
-
-  const createdImmediately = await tryExecuteFirstAvailableCommand(CHAT_NEW_THREAD_COMMANDS, availableCommands, result, 250);
-  if (!createdImmediately) {
-    await tryExecuteFirstAvailableCommand(CHAT_FOCUS_COMMANDS, availableCommands, result, 150);
-    await tryExecuteFirstAvailableCommand(CHAT_NEW_THREAD_COMMANDS, availableCommands, result, 250);
-  }
-
-  if (result.createdThread && !result.focused) {
-    await tryExecuteFirstAvailableCommand(CHAT_FOCUS_COMMANDS, availableCommands, result, 150);
-  }
-
-  return result;
-}
-
-async function tryExecuteFirstAvailableCommand(
-  commands: readonly string[],
-  availableCommands: ReadonlySet<string>,
-  result: ChatLaunchResult,
-  waitMs: number
-): Promise<boolean> {
-  for (const command of commands) {
-    if (!availableCommands.has(command)) {
-      continue;
-    }
-
-    try {
-      await vscode.commands.executeCommand(command);
-      result.commands.push(command);
-      if (CHAT_FOCUS_COMMANDS.includes(command)) {
-        result.focused = true;
-      }
-      if (CHAT_NEW_THREAD_COMMANDS.includes(command)) {
-        result.createdThread = true;
-      }
-      await delay(waitMs);
-      return true;
-    } catch {
-      // Try the next available command.
-    }
-  }
-
-  return false;
-}
-
-async function delay(ms: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function parsePullRequestDraft(content: string): PullRequestDraft | undefined {
   const normalized = content.trim();
@@ -2378,6 +2322,7 @@ function renderReasoningMarkdown(payload: Record<string, unknown>): string {
   appendField("Engine", payload.engine);
   appendField("Agent", payload.agentName);
   appendField("Model", payload.modelName);
+  appendField("Reasoning Effort", payload.reasoningEffort);
   appendField("Output File", payload.outputFile);
   appendField("Reasoning File", payload.reasoningFile);
 
@@ -2451,26 +2396,17 @@ function renderReasoningMarkdown(payload: Record<string, unknown>): string {
     lines.push("```");
   }
 
-  const backendEvent = payload.backendEvent ?? payload.codexCliEvent;
-  if (backendEvent !== undefined) {
-    lines.push("");
-    lines.push("## Latest Backend Event");
-    lines.push("");
-    lines.push("```json");
-    lines.push(JSON.stringify(backendEvent, null, 2));
-    lines.push("```");
-  }
-
   return `${lines.join("\n")}\n`;
 }
 
 function renderOutputWithExecutionInfo(
   content: string,
-  details: { agentName: string; modelName: string }
+  details: { agentName: string; modelName: string; reasoningEffort?: CmsisDevReasoningEffort }
 ): string {
   return [
-    `> AI agent: **${details.agentName}**`,
+    `> Interface: **${details.agentName}**`,
     `> Model: **${details.modelName}**`,
+    ...(details.reasoningEffort ? [`> Reasoning Effort: **${details.reasoningEffort}**`] : []),
     "",
     content.trim()
   ].join("\n");

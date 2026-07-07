@@ -6,9 +6,7 @@ import { ActionsProvider } from "./actionsProvider";
 import {
   describeAiSettings,
   formatLanguageModelLabel,
-  getConfiguredAiBackend,
   getConfiguredLanguageModelSelector,
-  getPreferredSettingsTarget,
   listAvailableLanguageModels,
   updateConfiguredLanguageModelSelector
 } from "./aiSettings";
@@ -19,7 +17,7 @@ import {
   registerCmsisDevLanguageModelProvider
 } from "./languageModelProvider";
 import { getRelatedRunFilePaths, RunOutputItem, RunsProvider } from "./runsProvider";
-import { clearGitHubToken, initializeSecretStorage, setGitHubToken } from "./secrets";
+import { clearGitHubToken, getGitHubToken, initializeSecretStorage, setGitHubToken } from "./secrets";
 import { WorkflowDefinition } from "./types";
 import { createWorkflowDiagnosticCollection, refreshWorkflowDiagnostics, validateWorkflowTextDocument } from "./workflowDiagnostics";
 import { WorkflowsProvider } from "./workflowsProvider";
@@ -27,21 +25,31 @@ import {
   DEFAULT_WORKFLOW_CONFIG_PATH,
   getConfiguredWorkflowConfigPath,
   initializeWorkflowConfig,
+  loadWorkflowDefinitions,
   resolveWorkspaceWorkflowConfigUri,
   resolveWorkflowRunsDirUri
 } from "./workflowConfig";
 import {
   getActiveOutputFollowUpState,
-  openChatForActiveOutput,
-  openCodexChatForActiveOutput,
   openIssueForActiveOutput,
+  openIssueForOutputUri,
   openPrForActiveOutput,
+  openPrForOutputUri,
   openReasoningForActiveOutput,
+  openReasoningForOutputUri,
   PromptWorkflowResult,
   postCommentForActiveOutput,
+  postCommentForOutputUri,
   runPromptWorkflow,
-  submitPrForActiveOutput
+  submitPrForActiveOutput,
+  submitPrForOutputUri
 } from "./workflows/promptWorkflow";
+import {
+  CMSIS_DEV_REASONING_EFFORTS,
+  formatReasoningEffortLabel,
+  getConfiguredReasoningEffort,
+  updateConfiguredReasoningEffort
+} from "./reasoningEffort";
 
 let mcpProcess: cp.ChildProcess | undefined;
 
@@ -98,11 +106,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (
-        event.affectsConfiguration("cmsisDev.aiBackend") ||
         event.affectsConfiguration("cmsisDev.languageModelSelector") ||
         event.affectsConfiguration("cmsisDev.languageModelProvider.baseUrl") ||
-        event.affectsConfiguration("cmsisDev.codexModel") ||
-        event.affectsConfiguration("cmsisDev.codexReasoningEffort")
+        event.affectsConfiguration("cmsisDev.reasoningEffort")
       ) {
         void updateActionsViewDescription(actionsTreeView);
       }
@@ -125,8 +131,50 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await runWorkflowWithStatus(chosen);
       await runsProvider.refresh();
     }),
+    vscode.commands.registerCommand("cmsisDev.planNextStepsForRunOutput", async (item?: unknown) => {
+      const targetUri = resolveRunOutputUri(item);
+      if (!targetUri) {
+        return;
+      }
+      const workflow = await resolveWorkflowById("plan-next-steps");
+      if (!workflow) {
+        vscode.window.showWarningMessage("The 'Plan Next Steps' workflow is not available.");
+        return;
+      }
+      await runWorkflowWithStatus(workflow, { presetRunOutputUri: targetUri });
+      await runsProvider.refresh();
+    }),
+    vscode.commands.registerCommand("cmsisDev.attachRunOutputToChat", async (item?: unknown) => {
+      const targetUri = resolveRunOutputUri(item);
+      if (!targetUri) {
+        return;
+      }
+      const document = await vscode.workspace.openTextDocument(targetUri);
+      await vscode.window.showTextDocument(document, { preview: true, preserveFocus: true });
+
+      for (const command of ["workbench.panel.chat.view.copilot.focus", "workbench.action.chat.open"]) {
+        try {
+          await vscode.commands.executeCommand(command);
+          break;
+        } catch {
+          // Try the next chat-opening command.
+        }
+      }
+    }),
     vscode.commands.registerCommand("cmsisDev.refreshRuns", async () => {
       await runsProvider.refresh();
+    }),
+    vscode.commands.registerCommand("cmsisDev.openRunOutputPreview", async (uri: unknown) => {
+      const targetUri = toFileUri(uri);
+      if (!targetUri) {
+        vscode.window.showWarningMessage("Could not resolve the selected run output path.");
+        return;
+      }
+      const document = await vscode.workspace.openTextDocument(targetUri);
+      await vscode.window.showTextDocument(document, {
+        preview: true,
+        preserveFocus: false
+      });
     }),
     vscode.commands.registerCommand(
       "cmsisDev.deleteRuns",
@@ -195,15 +243,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("cmsisDev.refreshWorkflows", async () => {
       await workflowsProvider.refresh();
     }),
-    vscode.commands.registerCommand("cmsisDev.selectAiBackend", async () => {
-      await selectAiBackend(actionsTreeView);
-    }),
     vscode.commands.registerCommand("cmsisDev.selectLanguageModel", async () => {
       await selectLanguageModel(actionsTreeView);
+    }),
+    vscode.commands.registerCommand("cmsisDev.selectReasoningEffort", async () => {
+      await selectReasoningEffort(actionsTreeView);
+    }),
+    vscode.commands.registerCommand("cmsisDev.configureIntegrations", async () => {
+      await configureIntegrations(languageModelProvider, actionsTreeView);
     }),
     vscode.commands.registerCommand("cmsisDev.manageLanguageModelProvider", async () => {
       await manageCmsisDevLanguageModelProvider(languageModelProvider);
       await updateActionsViewDescription(actionsTreeView);
+    }),
+    vscode.commands.registerCommand("cmsisDev.manageGitHubToken", async () => {
+      await manageGitHubToken();
     }),
     vscode.commands.registerCommand("cmsisDev.refreshLanguageModelProvider", async () => {
       await refreshCmsisDevLanguageModelProvider(languageModelProvider);
@@ -229,26 +283,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await clearGitHubToken();
       vscode.window.showInformationMessage("CMSIS-Dev GitHub token removed from SecretStorage.");
     }),
-    vscode.commands.registerCommand("cmsisDev.openReasoningForActiveOutput", async () => {
-      await openReasoningForActiveOutput();
+    vscode.commands.registerCommand("cmsisDev.openReasoningForActiveOutput", async (item?: unknown) => {
+      const targetUri = resolveRunOutputUri(item);
+      await (targetUri ? openReasoningForOutputUri(targetUri) : openReasoningForActiveOutput());
     }),
-    vscode.commands.registerCommand("cmsisDev.postCommentForActiveOutput", async () => {
-      await postCommentForActiveOutput();
+    vscode.commands.registerCommand("cmsisDev.postCommentForActiveOutput", async (item?: unknown) => {
+      const targetUri = resolveRunOutputUri(item);
+      await (targetUri ? postCommentForOutputUri(targetUri) : postCommentForActiveOutput());
     }),
-    vscode.commands.registerCommand("cmsisDev.openPrForActiveOutput", async () => {
-      await openPrForActiveOutput();
+    vscode.commands.registerCommand("cmsisDev.openPrForActiveOutput", async (item?: unknown) => {
+      const targetUri = resolveRunOutputUri(item);
+      await (targetUri ? openPrForOutputUri(targetUri) : openPrForActiveOutput());
     }),
-    vscode.commands.registerCommand("cmsisDev.openIssueForActiveOutput", async () => {
-      await openIssueForActiveOutput();
+    vscode.commands.registerCommand("cmsisDev.openIssueForActiveOutput", async (item?: unknown) => {
+      const targetUri = resolveRunOutputUri(item);
+      await (targetUri ? openIssueForOutputUri(targetUri) : openIssueForActiveOutput());
     }),
-    vscode.commands.registerCommand("cmsisDev.openChatForActiveOutput", async () => {
-      await openChatForActiveOutput();
-    }),
-    vscode.commands.registerCommand("cmsisDev.openCodexChatForActiveOutput", async () => {
-      await openCodexChatForActiveOutput();
-    }),
-    vscode.commands.registerCommand("cmsisDev.submitPrForActiveOutput", async () => {
-      await submitPrForActiveOutput();
+    vscode.commands.registerCommand("cmsisDev.submitPrForActiveOutput", async (item?: unknown) => {
+      const targetUri = resolveRunOutputUri(item);
+      await (targetUri ? submitPrForOutputUri(targetUri) : submitPrForActiveOutput());
     })
   );
 
@@ -299,6 +352,43 @@ function isRunOutputItem(value: unknown): value is RunOutputItem {
   return value.uri instanceof vscode.Uri && typeof value.modifiedAt === "number";
 }
 
+function resolveRunOutputUri(value: unknown): vscode.Uri | undefined {
+  if (isRunOutputItem(value)) {
+    return value.uri;
+  }
+
+  return toFileUri(value);
+}
+
+function toFileUri(value: unknown): vscode.Uri | undefined {
+  if (value instanceof vscode.Uri) {
+    return value.scheme === "file" ? value : undefined;
+  }
+
+  if (typeof value === "string" && value.trim().length > 0) {
+    return vscode.Uri.file(value);
+  }
+
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    if (typeof record.fsPath === "string" && record.fsPath.trim().length > 0) {
+      return vscode.Uri.file(record.fsPath);
+    }
+
+    if (typeof record.path === "string" && typeof record.scheme === "string" && record.scheme === "file") {
+      return vscode.Uri.from({
+        scheme: "file",
+        authority: typeof record.authority === "string" ? record.authority : "",
+        path: record.path,
+        query: typeof record.query === "string" ? record.query : "",
+        fragment: typeof record.fragment === "string" ? record.fragment : ""
+      });
+    }
+  }
+
+  return undefined;
+}
+
 export function deactivate(): void {
   if (mcpProcess && !mcpProcess.killed) {
     mcpProcess.kill();
@@ -326,14 +416,27 @@ async function chooseWorkflow(provider: ActionsProvider): Promise<WorkflowDefini
   return pick?.workflow;
 }
 
-async function runWorkflow(
-  workflow: WorkflowDefinition,
-  onStatus?: (status: string) => void
-): Promise<PromptWorkflowResult> {
-  return runPromptWorkflow(workflow, { onStatus });
+async function resolveWorkflowById(workflowId: string): Promise<WorkflowDefinition | undefined> {
+  const workflows = await loadWorkflowDefinitions();
+  return workflows.find((workflow) => workflow.id === workflowId);
 }
 
-async function runWorkflowWithStatus(workflow: WorkflowDefinition): Promise<void> {
+async function runWorkflow(
+  workflow: WorkflowDefinition,
+  options: {
+    onStatus?: (status: string) => void;
+    presetRunOutputUri?: vscode.Uri;
+  } = {}
+): Promise<PromptWorkflowResult> {
+  return runPromptWorkflow(workflow, options);
+}
+
+async function runWorkflowWithStatus(
+  workflow: WorkflowDefinition,
+  options: {
+    presetRunOutputUri?: vscode.Uri;
+  } = {}
+): Promise<void> {
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   statusBar.name = "CMSIS-Dev AI Action";
   statusBar.text = `$(sync~spin) CMSIS-Dev: Running ${workflow.title}`;
@@ -341,8 +444,11 @@ async function runWorkflowWithStatus(workflow: WorkflowDefinition): Promise<void
   let dismissAfterMs = 8000;
 
   try {
-    const result = await runWorkflow(workflow, (status) => {
-      statusBar.text = `$(sync~spin) CMSIS-Dev: ${status}`;
+    const result = await runWorkflow(workflow, {
+      onStatus: (status) => {
+        statusBar.text = `$(sync~spin) CMSIS-Dev: ${status}`;
+      },
+      presetRunOutputUri: options.presetRunOutputUri
     });
 
     if (result.canceled) {
@@ -370,36 +476,6 @@ async function runWorkflowWithStatus(workflow: WorkflowDefinition): Promise<void
 
 async function updateActionsViewDescription(actionsTreeView: vscode.TreeView<unknown>): Promise<void> {
   actionsTreeView.description = await describeAiSettings();
-}
-
-async function selectAiBackend(actionsTreeView: vscode.TreeView<unknown>): Promise<void> {
-  const configuredBackend = getConfiguredAiBackend();
-  const selected = await vscode.window.showQuickPick(
-    [
-      {
-        label: "VS Code Language Model",
-        description: configuredBackend === "vscodeLm" ? "Current selection" : undefined,
-        detail: "Run CMSIS-Dev actions through the VS Code model/provider system and built-in chat.",
-        value: "vscodeLm"
-      },
-      {
-        label: "Codex CLI",
-        description: configuredBackend === "codexCli" ? "Current selection" : undefined,
-        detail: "Keep using local `codex exec` for workflow generation.",
-        value: "codexCli"
-      }
-    ],
-    {
-      title: "Select AI Backend",
-      placeHolder: "Choose how CMSIS-Dev runs AI actions"
-    }
-  );
-  if (!selected) {
-    return;
-  }
-
-  await vscode.workspace.getConfiguration("cmsisDev").update("aiBackend", selected.value, getPreferredSettingsTarget());
-  await updateActionsViewDescription(actionsTreeView);
 }
 
 async function selectLanguageModel(actionsTreeView: vscode.TreeView<unknown>): Promise<void> {
@@ -448,13 +524,120 @@ async function selectLanguageModel(actionsTreeView: vscode.TreeView<unknown>): P
   await updateActionsViewDescription(actionsTreeView);
 }
 
+async function selectReasoningEffort(actionsTreeView: vscode.TreeView<unknown>): Promise<void> {
+  const configuredEffort = getConfiguredReasoningEffort();
+  const selected = await vscode.window.showQuickPick(
+    [
+      {
+        label: "Default",
+        description: !configuredEffort ? "Current selection" : undefined,
+        detail: "Do not send a CMSIS-Dev reasoning.effort override.",
+        effort: undefined
+      },
+      ...CMSIS_DEV_REASONING_EFFORTS.map((effort) => ({
+        label: effort,
+        description: configuredEffort === effort ? "Current selection" : undefined,
+        detail: formatReasoningEffortLabel(effort),
+        effort
+      }))
+    ],
+    {
+      title: "Select CMSIS-Dev Reasoning Effort",
+      placeHolder: "Choose the default reasoning.effort CMSIS-Dev should send for supported models"
+    }
+  );
+  if (!selected) {
+    return;
+  }
+
+  await updateConfiguredReasoningEffort(selected.effort);
+  await updateActionsViewDescription(actionsTreeView);
+}
+
+async function manageGitHubToken(): Promise<void> {
+  const hasToken = Boolean(await getGitHubToken());
+  const action = await vscode.window.showQuickPick(
+    [
+      {
+        label: "Set GitHub Token",
+        detail: "Store a GitHub personal access token in SecretStorage.",
+        value: "set"
+      },
+      {
+        label: "Clear GitHub Token",
+        detail: hasToken ? "Remove the stored GitHub token from SecretStorage." : "No GitHub token is currently stored.",
+        value: "clear"
+      }
+    ],
+    {
+      title: "Manage GitHub Token",
+      placeHolder: "Choose a GitHub token action"
+    }
+  );
+
+  if (!action) {
+    return;
+  }
+
+  if (action.value === "set") {
+    await vscode.commands.executeCommand("cmsisDev.setGitHubToken");
+    return;
+  }
+
+  if (!hasToken) {
+    vscode.window.showInformationMessage("No CMSIS-Dev GitHub token is currently stored.");
+    return;
+  }
+
+  await vscode.commands.executeCommand("cmsisDev.clearGitHubToken");
+}
+
+async function configureIntegrations(
+  languageModelProvider: ReturnType<typeof registerCmsisDevLanguageModelProvider>,
+  actionsTreeView: vscode.TreeView<unknown>
+): Promise<void> {
+  const hasGitHubToken = Boolean(await getGitHubToken());
+  const selected = await vscode.window.showQuickPick(
+    [
+      {
+        label: "Language Model Provider",
+        detail: "Configure the CMSIS-Dev OpenAI-compatible provider URL, API key, and model validation.",
+        action: "provider"
+      },
+      {
+        label: hasGitHubToken ? "GitHub Token" : "GitHub Token (Setup Recommended)",
+        detail: hasGitHubToken
+          ? "Set or clear the GitHub token used for PR and issue workflows."
+          : "Configure the GitHub token used for PR and issue workflows.",
+        action: "github"
+      }
+    ],
+    {
+      title: "Configure CMSIS-Dev Integrations",
+      placeHolder: "Choose what you want to configure"
+    }
+  );
+
+  if (!selected) {
+    return;
+  }
+
+  if (selected.action === "provider") {
+    await manageCmsisDevLanguageModelProvider(languageModelProvider);
+    await updateActionsViewDescription(actionsTreeView);
+    return;
+  }
+
+  await manageGitHubToken();
+}
+
 async function startMcpServer(context: vscode.ExtensionContext): Promise<void> {
   const serverScript = path.join(context.extensionPath, "out", "mcp", "server.js");
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
   const workspaceWorkflowConfigUri = await resolveWorkspaceWorkflowConfigUri();
   const runsDirUri = await resolveWorkflowRunsDirUri();
 
-  mcpProcess = cp.spawn(process.execPath, [serverScript], {
+  mcpProcess = cp.spawn(process.execPath, ["--enable-source-maps", serverScript], {
     cwd: workspaceFolder?.uri.fsPath ?? context.extensionPath,
     env: {
       ...process.env,
@@ -522,8 +705,6 @@ async function updateActiveOutputContexts(editor: vscode.TextEditor | undefined)
     vscode.commands.executeCommand("setContext", "cmsisDev.activeOutput.canOpenPr", followUpState.canOpenPr),
     vscode.commands.executeCommand("setContext", "cmsisDev.activeOutput.canOpenIssue", followUpState.canOpenIssue),
     vscode.commands.executeCommand("setContext", "cmsisDev.activeOutput.canPostComment", followUpState.canPostComment),
-    vscode.commands.executeCommand("setContext", "cmsisDev.activeOutput.canSubmitPr", followUpState.canSubmitPr),
-    vscode.commands.executeCommand("setContext", "cmsisDev.activeOutput.canOpenChat", followUpState.canOpenChat),
-    vscode.commands.executeCommand("setContext", "cmsisDev.activeOutput.canOpenCodexChat", followUpState.canOpenCodexChat)
+    vscode.commands.executeCommand("setContext", "cmsisDev.activeOutput.canSubmitPr", followUpState.canSubmitPr)
   ]);
 }

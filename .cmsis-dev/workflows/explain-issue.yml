@@ -6,14 +6,6 @@ type: explain-issue
 followUps:
   - openReasoning
   - openIssue
-  - openChat
-openChatPromptTemplate: |
-  Use the CMSIS-Dev reasoning file as context.
-  If it is not already attached in chat, add it before you send this prompt.
-  It contains the generated issue explanation plus the workflow context that produced it.
-  Ask the smallest set of concrete follow-up questions needed to resolve the open questions or missing information.
-  Group related questions together and avoid repeating facts already established in the attached explanation.
-  If some missing information can be inferred from the local repo, investigate that first before asking.
 inputs:
   - id: issue
     label: GitHub Issue

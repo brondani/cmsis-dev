@@ -546,8 +546,6 @@ async function normalizeWorkflows(workflows: WorkflowDefinition[]): Promise<Work
         ...workflow,
         inputs,
         promptTemplate: workflow.promptTemplate?.trim() ? workflow.promptTemplate : starter?.promptTemplate,
-        openChatPromptTemplate: resolveOpenChatPromptTemplate(workflow, starter),
-        openCodexChatPromptTemplate: resolveOpenChatPromptTemplate(workflow, starter),
         followUps: normalizeFollowUps(workflow.followUps, starter?.followUps ?? DEFAULT_OUTPUT_FOLLOW_UPS)
       };
     }
@@ -571,8 +569,6 @@ async function normalizeWorkflows(workflows: WorkflowDefinition[]): Promise<Work
         ...workflow,
         inputs,
         promptTemplate: workflow.promptTemplate?.trim() ? workflow.promptTemplate : starter?.promptTemplate,
-        openChatPromptTemplate: resolveOpenChatPromptTemplate(workflow, starter),
-        openCodexChatPromptTemplate: resolveOpenChatPromptTemplate(workflow, starter),
         followUps: normalizeFollowUps(workflow.followUps, starter?.followUps ?? DEFAULT_OUTPUT_FOLLOW_UPS)
       };
     }
@@ -596,8 +592,6 @@ async function normalizeWorkflows(workflows: WorkflowDefinition[]): Promise<Work
         ...workflow,
         inputs,
         promptTemplate: workflow.promptTemplate?.trim() ? workflow.promptTemplate : starter?.promptTemplate,
-        openChatPromptTemplate: resolveOpenChatPromptTemplate(workflow, starter),
-        openCodexChatPromptTemplate: resolveOpenChatPromptTemplate(workflow, starter),
         followUps: normalizeFollowUps(workflow.followUps, starter?.followUps ?? DEFAULT_OUTPUT_FOLLOW_UPS)
       };
     }
@@ -621,8 +615,6 @@ async function normalizeWorkflows(workflows: WorkflowDefinition[]): Promise<Work
         ...workflow,
         inputs,
         promptTemplate: workflow.promptTemplate?.trim() ? workflow.promptTemplate : starter?.promptTemplate,
-        openChatPromptTemplate: resolveOpenChatPromptTemplate(workflow, starter),
-        openCodexChatPromptTemplate: resolveOpenChatPromptTemplate(workflow, starter),
         followUps: normalizeFollowUps(workflow.followUps, starter?.followUps ?? DEFAULT_OUTPUT_FOLLOW_UPS)
       };
     }
@@ -638,26 +630,9 @@ function normalizeFollowUps(
   followUps: WorkflowFollowUp[] | undefined,
   fallback: readonly WorkflowFollowUp[]
 ): WorkflowFollowUp[] {
-  const allowed = new Set<WorkflowFollowUp>(["openReasoning", "openPr", "openIssue", "postComment", "submitPr", "openChat", "openCodexChat"]);
+  const allowed = new Set<WorkflowFollowUp>(["openReasoning", "openPr", "openIssue", "postComment", "submitPr"]);
   const normalized = Array.from(
-    new Set(
-      (followUps ?? [...fallback])
-        .filter((followUp) => allowed.has(followUp))
-        .map((followUp) => (followUp === "openCodexChat" ? "openChat" : followUp))
-    )
+    new Set((followUps ?? [...fallback]).filter((followUp) => allowed.has(followUp)))
   ) as WorkflowFollowUp[];
   return normalized.length > 0 ? normalized : [...fallback];
-}
-
-function resolveOpenChatPromptTemplate(
-  workflow: Pick<WorkflowDefinition, "openChatPromptTemplate" | "openCodexChatPromptTemplate">,
-  starter: Pick<WorkflowDefinition, "openChatPromptTemplate" | "openCodexChatPromptTemplate"> | undefined
-): string | undefined {
-  return workflow.openChatPromptTemplate?.trim()
-    ? workflow.openChatPromptTemplate
-    : workflow.openCodexChatPromptTemplate?.trim()
-      ? workflow.openCodexChatPromptTemplate
-      : starter?.openChatPromptTemplate?.trim()
-        ? starter.openChatPromptTemplate
-        : starter?.openCodexChatPromptTemplate;
 }

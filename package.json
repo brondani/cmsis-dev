@@ -4,6 +4,15 @@
   "description": "CMSIS development helper extension with AI workflows and an MCP server.",
   "version": "0.0.1",
   "publisher": "cmsis-dev",
+  "icon": "media/arm.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/brondani/CMSIS-Dev.git"
+  },
+  "homepage": "https://github.com/brondani/CMSIS-Dev",
+  "bugs": {
+    "url": "https://github.com/brondani/CMSIS-Dev/issues"
+  },
   "engines": {
     "vscode": "^1.125.0"
   },
@@ -20,17 +29,18 @@
     "onCommand:cmsisDev.refreshWorkflows",
     "onCommand:cmsisDev.refreshRuns",
     "onCommand:cmsisDev.deleteRuns",
-    "onCommand:cmsisDev.selectAiBackend",
     "onCommand:cmsisDev.selectLanguageModel",
-    "onCommand:cmsisDev.manageLanguageModelProvider",
+    "onCommand:cmsisDev.selectReasoningEffort",
+    "onCommand:cmsisDev.configureIntegrations",
     "onCommand:cmsisDev.refreshLanguageModelProvider",
     "onCommand:cmsisDev.setGitHubToken",
     "onCommand:cmsisDev.clearGitHubToken",
+    "onCommand:cmsisDev.planNextStepsForRunOutput",
+    "onCommand:cmsisDev.attachRunOutputToChat",
     "onCommand:cmsisDev.openReasoningForActiveOutput",
     "onCommand:cmsisDev.postCommentForActiveOutput",
     "onCommand:cmsisDev.openPrForActiveOutput",
     "onCommand:cmsisDev.openIssueForActiveOutput",
-    "onCommand:cmsisDev.openChatForActiveOutput",
     "onCommand:cmsisDev.submitPrForActiveOutput"
   ],
   "main": "./out/extension.js",
@@ -54,18 +64,18 @@
         "title": "CMSIS-Dev: Create Workflow Overrides"
       },
       {
-        "command": "cmsisDev.selectAiBackend",
-        "title": "CMSIS-Dev: Set AI Backend",
+        "command": "cmsisDev.selectLanguageModel",
+        "title": "CMSIS-Dev: Set VS Code Model",
         "icon": "$(hubot)"
       },
       {
-        "command": "cmsisDev.selectLanguageModel",
-        "title": "CMSIS-Dev: Set VS Code Model",
-        "icon": "$(pulse)"
+        "command": "cmsisDev.selectReasoningEffort",
+        "title": "CMSIS-Dev: Set Reasoning Effort",
+        "icon": "$(lightbulb)"
       },
       {
-        "command": "cmsisDev.manageLanguageModelProvider",
-        "title": "CMSIS-Dev: Manage Language Model Provider",
+        "command": "cmsisDev.configureIntegrations",
+        "title": "CMSIS-Dev: Configure Integrations",
         "icon": "$(gear)"
       },
       {
@@ -97,6 +107,16 @@
         "title": "CMSIS-Dev: Clear GitHub Token"
       },
       {
+        "command": "cmsisDev.planNextStepsForRunOutput",
+        "title": "CMSIS-Dev: Plan Next Steps",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "cmsisDev.attachRunOutputToChat",
+        "title": "CMSIS-Dev: Attach to Chat",
+        "icon": "$(comment-discussion)"
+      },
+      {
         "command": "cmsisDev.openReasoningForActiveOutput",
         "title": "CMSIS-Dev: Open Reasoning",
         "icon": "$(file-code)"
@@ -115,11 +135,6 @@
         "command": "cmsisDev.openIssueForActiveOutput",
         "title": "CMSIS-Dev: Open Issue",
         "icon": "$(link-external)"
-      },
-      {
-        "command": "cmsisDev.openChatForActiveOutput",
-        "title": "CMSIS-Dev: Open in Chat",
-        "icon": "$(send)"
       },
       {
         "command": "cmsisDev.submitPrForActiveOutput",
@@ -147,17 +162,17 @@
     "menus": {
       "view/title": [
         {
-          "command": "cmsisDev.selectAiBackend",
-          "when": "view == cmsisDev.actions",
-          "group": "navigation"
-        },
-        {
           "command": "cmsisDev.selectLanguageModel",
           "when": "view == cmsisDev.actions",
           "group": "navigation"
         },
         {
-          "command": "cmsisDev.manageLanguageModelProvider",
+          "command": "cmsisDev.selectReasoningEffort",
+          "when": "view == cmsisDev.actions",
+          "group": "navigation"
+        },
+        {
+          "command": "cmsisDev.configureIntegrations",
           "when": "view == cmsisDev.actions",
           "group": "navigation"
         },
@@ -179,78 +194,84 @@
       ],
       "view/item/context": [
         {
-          "command": "cmsisDev.deleteRuns",
-          "when": "view == cmsisDev.runs && viewItem == cmsisDev.runOutput",
-          "group": "inline"
-        },
-        {
-          "command": "cmsisDev.deleteRuns",
-          "when": "view == cmsisDev.runs && viewItem == cmsisDev.runOutput",
-          "group": "2_cmsisDev@1"
-        }
-      ],
-      "editor/title": [
-        {
           "command": "cmsisDev.openPrForActiveOutput",
-          "when": "cmsisDev.activeOutput.canOpenPr",
-          "group": "navigation@9"
+          "when": "view == cmsisDev.runs && viewItem =~ /(^|\\.)canOpenPr(\\.|$)/",
+          "group": "inline@1"
         },
         {
           "command": "cmsisDev.openIssueForActiveOutput",
-          "when": "cmsisDev.activeOutput.canOpenIssue",
-          "group": "navigation@9"
+          "when": "view == cmsisDev.runs && viewItem =~ /(^|\\.)canOpenIssue(\\.|$)/",
+          "group": "inline@2"
         },
         {
           "command": "cmsisDev.openReasoningForActiveOutput",
-          "when": "cmsisDev.activeOutput.canOpenReasoning",
-          "group": "navigation@10"
+          "when": "view == cmsisDev.runs && viewItem =~ /(^|\\.)canOpenReasoning(\\.|$)/",
+          "group": "inline@3"
         },
         {
           "command": "cmsisDev.postCommentForActiveOutput",
-          "when": "cmsisDev.activeOutput.canPostComment",
-          "group": "navigation@11"
+          "when": "view == cmsisDev.runs && viewItem =~ /(^|\\.)canPostComment(\\.|$)/",
+          "group": "inline@4"
         },
         {
-          "command": "cmsisDev.openChatForActiveOutput",
-          "when": "cmsisDev.activeOutput.canOpenChat",
-          "group": "navigation@12"
+          "command": "cmsisDev.planNextStepsForRunOutput",
+          "when": "view == cmsisDev.runs && viewItem =~ /(^|\\.)canPlanNextSteps(\\.|$)/",
+          "group": "inline@5"
+        },
+        {
+          "command": "cmsisDev.attachRunOutputToChat",
+          "when": "view == cmsisDev.runs && viewItem =~ /(^|\\.)canAttachToChat(\\.|$)/",
+          "group": "inline@6"
         },
         {
           "command": "cmsisDev.submitPrForActiveOutput",
-          "when": "cmsisDev.activeOutput.canSubmitPr",
-          "group": "navigation@13"
-        }
-      ],
-      "editor/title/context": [
+          "when": "view == cmsisDev.runs && viewItem =~ /(^|\\.)canSubmitPr(\\.|$)/",
+          "group": "inline@7"
+        },
+        {
+          "command": "cmsisDev.deleteRuns",
+          "when": "view == cmsisDev.runs && viewItem =~ /^cmsisDev\\.runOutput(\\.|$)/",
+          "group": "inline@8"
+        },
         {
           "command": "cmsisDev.openPrForActiveOutput",
-          "when": "cmsisDev.activeOutput.canOpenPr",
+          "when": "view == cmsisDev.runs && viewItem =~ /(^|\\.)canOpenPr(\\.|$)/",
           "group": "2_cmsisDev@1"
         },
         {
           "command": "cmsisDev.openIssueForActiveOutput",
-          "when": "cmsisDev.activeOutput.canOpenIssue",
+          "when": "view == cmsisDev.runs && viewItem =~ /(^|\\.)canOpenIssue(\\.|$)/",
           "group": "2_cmsisDev@2"
         },
         {
           "command": "cmsisDev.openReasoningForActiveOutput",
-          "when": "cmsisDev.activeOutput.canOpenReasoning",
+          "when": "view == cmsisDev.runs && viewItem =~ /(^|\\.)canOpenReasoning(\\.|$)/",
           "group": "2_cmsisDev@3"
         },
         {
           "command": "cmsisDev.postCommentForActiveOutput",
-          "when": "cmsisDev.activeOutput.canPostComment",
+          "when": "view == cmsisDev.runs && viewItem =~ /(^|\\.)canPostComment(\\.|$)/",
           "group": "2_cmsisDev@4"
         },
         {
-          "command": "cmsisDev.openChatForActiveOutput",
-          "when": "cmsisDev.activeOutput.canOpenChat",
+          "command": "cmsisDev.planNextStepsForRunOutput",
+          "when": "view == cmsisDev.runs && viewItem =~ /(^|\\.)canPlanNextSteps(\\.|$)/",
           "group": "2_cmsisDev@5"
         },
         {
-          "command": "cmsisDev.submitPrForActiveOutput",
-          "when": "cmsisDev.activeOutput.canSubmitPr",
+          "command": "cmsisDev.attachRunOutputToChat",
+          "when": "view == cmsisDev.runs && viewItem =~ /(^|\\.)canAttachToChat(\\.|$)/",
           "group": "2_cmsisDev@6"
+        },
+        {
+          "command": "cmsisDev.submitPrForActiveOutput",
+          "when": "view == cmsisDev.runs && viewItem =~ /(^|\\.)canSubmitPr(\\.|$)/",
+          "group": "2_cmsisDev@7"
+        },
+        {
+          "command": "cmsisDev.deleteRuns",
+          "when": "view == cmsisDev.runs && viewItem =~ /^cmsisDev\\.runOutput(\\.|$)/",
+          "group": "2_cmsisDev@8"
         }
       ]
     },
@@ -281,6 +302,10 @@
           {
             "name": "explain-issue",
             "description": "Explain a GitHub issue."
+          },
+          {
+            "name": "plan-next-steps",
+            "description": "Continue from a previous CMSIS-Dev run in chat."
           }
         ]
       }
@@ -300,19 +325,22 @@
           "default": ".cmsis-dev/workflows",
           "description": "Relative path to the workflow configuration file or directory."
         },
-        "cmsisDev.aiBackend": {
-          "type": "string",
-          "enum": [
-            "vscodeLm",
-            "codexCli"
-          ],
-          "default": "vscodeLm",
-          "description": "How CMSIS-Dev should execute AI workflows."
-        },
         "cmsisDev.languageModelSelector": {
           "type": "object",
           "default": {},
           "markdownDescription": "Optional VS Code language model selector for CMSIS-Dev actions. Use the command palette action to populate this setting."
+        },
+        "cmsisDev.reasoningEffort": {
+          "type": "string",
+          "enum": [
+            "",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "default": "",
+          "markdownDescription": "Optional `reasoning.effort` override sent by CMSIS-Dev for supported reasoning-capable models. Empty means no override."
         },
         "cmsisDev.languageModelProvider.baseUrl": {
           "type": "string",
@@ -328,16 +356,6 @@
           "type": "number",
           "default": 16384,
           "description": "Fallback maximum output token count used when the provider model catalog does not report one."
-        },
-        "cmsisDev.codexModel": {
-          "type": "string",
-          "default": "",
-          "description": "Optional Codex model override when the AI backend is set to codexCli."
-        },
-        "cmsisDev.codexReasoningEffort": {
-          "type": "string",
-          "default": "",
-          "description": "Optional Codex reasoning effort override when the AI backend is set to codexCli."
         }
       }
     }
@@ -346,6 +364,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "build:mcp": "tsc -p tsconfig.mcp.json",
+    "package:vsix": "npm run compile && npm run build:mcp && node scripts/package-vsix.js",
     "vscode:prepublish": "npm run compile && npm run build:mcp"
   },
   "devDependencies": {

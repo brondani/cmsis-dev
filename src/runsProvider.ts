@@ -2,24 +2,50 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { resolveWorkflowRunsDirUri } from "./workflowConfig";
+import { getOutputFollowUpStateForUri } from "./workflows/promptWorkflow";
+
+interface RunOutputMetadata {
+  workflowId?: string;
+  workflowTitle?: string;
+  prContext?: {
+    pr?: {
+      number?: number;
+    };
+  };
+  issueContext?: {
+    issue?: {
+      number?: number;
+    };
+  };
+  localChangesContext?: {
+    workspaceFolderName?: string;
+    rootPath?: string;
+  };
+}
 
 export class RunOutputItem extends vscode.TreeItem {
   readonly modifiedAt: number;
 
   constructor(
     public readonly uri: vscode.Uri,
-    modifiedAt: number
+    modifiedAt: number,
+    label: string,
+    contextValue: string
   ) {
-    super(path.basename(uri.fsPath), vscode.TreeItemCollapsibleState.None);
+    super(label, vscode.TreeItemCollapsibleState.None);
     this.modifiedAt = modifiedAt;
     this.resourceUri = uri;
     this.description = new Date(modifiedAt).toLocaleString();
-    this.tooltip = uri.fsPath;
-    this.contextValue = "cmsisDev.runOutput";
+    this.tooltip = [
+      path.basename(uri.fsPath),
+      `Updated: ${new Date(modifiedAt).toLocaleString()}`,
+      uri.fsPath
+    ].join("\n");
+    this.contextValue = contextValue;
     this.command = {
-      command: "vscode.open",
-      title: "Open Run Output",
-      arguments: [uri, { preview: true }]
+      command: "cmsisDev.openRunOutputPreview",
+      title: "Open as Preview",
+      arguments: [uri.fsPath]
     };
   }
 }
@@ -73,7 +99,14 @@ export class RunsProvider implements vscode.TreeDataProvider<RunsTreeItem> {
           .map(async (entry) => {
             const outputUri = vscode.Uri.file(path.join(runsDirUri.fsPath, entry.name));
             const stat = await fs.stat(outputUri.fsPath);
-            return new RunOutputItem(outputUri, stat.mtimeMs);
+            const metadata = await readRunOutputMetadata(outputUri);
+            const followUpState = await getOutputFollowUpStateForUri(outputUri);
+            return new RunOutputItem(
+              outputUri,
+              stat.mtimeMs,
+              getDisplayLabel(outputUri.fsPath, metadata),
+              toRunOutputContextValue(followUpState, metadata)
+            );
           })
       );
 
@@ -87,4 +120,49 @@ export class RunsProvider implements vscode.TreeDataProvider<RunsTreeItem> {
       return [];
     }
   }
+}
+
+async function readRunOutputMetadata(outputUri: vscode.Uri): Promise<RunOutputMetadata | undefined> {
+  try {
+    const raw = await fs.readFile(`${outputUri.fsPath}.meta.json`, "utf8");
+    return JSON.parse(raw) as RunOutputMetadata;
+  } catch {
+    return undefined;
+  }
+}
+
+function getDisplayLabel(fsPath: string, metadata?: RunOutputMetadata): string {
+  return path.basename(fsPath);
+}
+
+function toRunOutputContextValue(followUpState: {
+  canOpenReasoning: boolean;
+  canOpenPr: boolean;
+  canOpenIssue: boolean;
+  canPostComment: boolean;
+  canSubmitPr: boolean;
+}, metadata?: RunOutputMetadata): string {
+  const tokens = ["cmsisDev.runOutput"];
+  if (followUpState.canOpenReasoning) {
+    tokens.push("canOpenReasoning");
+  }
+  if (followUpState.canOpenPr) {
+    tokens.push("canOpenPr");
+  }
+  if (followUpState.canOpenIssue) {
+    tokens.push("canOpenIssue");
+  }
+  if (followUpState.canPostComment) {
+    tokens.push("canPostComment");
+  }
+  if (followUpState.canSubmitPr) {
+    tokens.push("canSubmitPr");
+  }
+  if (metadata?.workflowId === "review-pr" || metadata?.workflowId === "review-changes" || metadata?.workflowId === "explain-issue") {
+    tokens.push("canPlanNextSteps");
+  }
+  if (metadata?.workflowId === "plan-next-steps") {
+    tokens.push("canAttachToChat");
+  }
+  return tokens.join(".");
 }
