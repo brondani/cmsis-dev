@@ -79,7 +79,6 @@ export function registerCmsisDevChatParticipant(context: vscode.ExtensionContext
   });
 
   participant.iconPath = new vscode.ThemeIcon("hubot");
-  context.subscriptions.push(participant);
   return participant;
 }
 

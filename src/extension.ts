@@ -47,6 +47,13 @@ import {
 let mcpProcess: cp.ChildProcess | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  let disposed = false;
+  context.subscriptions.push({
+    dispose: () => {
+      disposed = true;
+    }
+  });
+
   initializeSecretStorage(context.secrets);
   const languageModelProvider = registerCmsisDevLanguageModelProvider(context);
   const provider = new ActionsProvider();
@@ -62,6 +69,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const workflowDiagnostics = createWorkflowDiagnosticCollection();
   const workflowWatchers = createWorkflowWatchers(getConfiguredWorkflowConfigPath());
   const runsWatcher = await createRunsWatcher(runsProvider);
+  if (disposed) {
+    for (const workflowWatcher of workflowWatchers) {
+      workflowWatcher.dispose();
+    }
+    runsWatcher?.dispose();
+    workflowDiagnostics.dispose();
+    actionsTreeView.dispose();
+    runsTreeView.dispose();
+    return;
+  }
 
   for (const workflowWatcher of workflowWatchers) {
     workflowWatcher.onDidCreate(() => {
@@ -314,7 +331,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await validateWorkflowTextDocument(document, workflowDiagnostics);
   }
   await updateActiveOutputContexts(vscode.window.activeTextEditor, runsProvider, runsTreeView);
-  void startMcpServer(context);
+  void startMcpServer(context, () => disposed);
 }
 
 function resolveRunDeletionTargets(
@@ -532,11 +549,15 @@ async function configureIntegrations(
   await manageGitHubToken();
 }
 
-async function startMcpServer(context: vscode.ExtensionContext): Promise<void> {
+async function startMcpServer(context: vscode.ExtensionContext, isDisposed: () => boolean): Promise<void> {
   const serverScript = path.join(context.extensionPath, "out", "mcp", "server.js");
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
   const workspaceWorkflowConfigUri = await resolveWorkspaceWorkflowConfigUri();
   const runsDirUri = await resolveWorkflowRunsDirUri();
+
+  if (isDisposed()) {
+    return;
+  }
 
   mcpProcess = cp.spawn(process.execPath, ["--enable-source-maps", serverScript], {
     cwd: workspaceFolder?.uri.fsPath ?? context.extensionPath,
@@ -550,6 +571,13 @@ async function startMcpServer(context: vscode.ExtensionContext): Promise<void> {
     stdio: "pipe",
     windowsHide: true
   });
+
+  if (isDisposed()) {
+    if (!mcpProcess.killed) {
+      mcpProcess.kill();
+    }
+    return;
+  }
 
   mcpProcess.on("error", (error) => {
     vscode.window.showWarningMessage(`CMSIS-Dev MCP server failed to start: ${error.message}`);
