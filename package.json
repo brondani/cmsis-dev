@@ -20,29 +20,7 @@
     "Other"
   ],
   "activationEvents": [
-    "onStartupFinished",
-    "onView:cmsisDev.actions",
-    "onView:cmsisDev.workflows",
-    "onView:cmsisDev.runs",
-    "onCommand:cmsisDev.runAction",
-    "onCommand:cmsisDev.runActionInChat",
-    "onCommand:cmsisDev.initializeWorkflows",
-    "onCommand:cmsisDev.refreshWorkflows",
-    "onCommand:cmsisDev.refreshRuns",
-    "onCommand:cmsisDev.deleteRuns",
-    "onCommand:cmsisDev.selectLanguageModel",
-    "onCommand:cmsisDev.selectReasoningEffort",
-    "onCommand:cmsisDev.configureIntegrations",
-    "onCommand:cmsisDev.refreshLanguageModelProvider",
-    "onCommand:cmsisDev.setGitHubToken",
-    "onCommand:cmsisDev.clearGitHubToken",
-    "onCommand:cmsisDev.planNextStepsForRunOutput",
-    "onCommand:cmsisDev.attachRunOutputToChat",
-    "onCommand:cmsisDev.openReasoningForActiveOutput",
-    "onCommand:cmsisDev.postCommentForActiveOutput",
-    "onCommand:cmsisDev.openPrForActiveOutput",
-    "onCommand:cmsisDev.openIssueForActiveOutput",
-    "onCommand:cmsisDev.submitPrForActiveOutput"
+    "onStartupFinished"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -57,10 +35,6 @@
     },
     "commands": [
       {
-        "command": "cmsisDev.runAction",
-        "title": "CMSIS-Dev: Run AI Action"
-      },
-      {
         "command": "cmsisDev.runActionInChat",
         "title": "CMSIS-Dev: Run AI Action in Chat"
       },
@@ -69,13 +43,8 @@
         "title": "CMSIS-Dev: Create Workflow Overrides"
       },
       {
-        "command": "cmsisDev.selectLanguageModel",
-        "title": "CMSIS-Dev: Set VS Code Model",
-        "icon": "$(hubot)"
-      },
-      {
         "command": "cmsisDev.selectReasoningEffort",
-        "title": "CMSIS-Dev: Set Reasoning Effort",
+        "title": "CMSIS-Dev: Set Reasoning Level",
         "icon": "$(lightbulb)"
       },
       {
@@ -166,11 +135,6 @@
     },
     "menus": {
       "view/title": [
-        {
-          "command": "cmsisDev.selectLanguageModel",
-          "when": "view == cmsisDev.actions",
-          "group": "navigation"
-        },
         {
           "command": "cmsisDev.selectReasoningEffort",
           "when": "view == cmsisDev.actions",
@@ -333,11 +297,6 @@
           "type": "string",
           "default": ".cmsis-dev/workflows",
           "description": "Relative path to the workflow configuration directory."
-        },
-        "cmsisDev.languageModelSelector": {
-          "type": "object",
-          "default": {},
-          "markdownDescription": "Optional VS Code language model selector for CMSIS-Dev actions. Use the command palette action to populate this setting."
         },
         "cmsisDev.reasoningEffort": {
           "type": "string",

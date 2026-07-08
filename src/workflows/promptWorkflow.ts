@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { formatLanguageModelLabel, formatLanguageModelSelector, getConfiguredLanguageModelSelector, resolveConfiguredLanguageModel } from "../aiSettings";
+import { formatLanguageModelLabel, resolveConfiguredLanguageModel } from "../aiSettings";
 import {
   buildReasoningModelOptions,
   CmsisDevReasoningEffort,
@@ -57,6 +57,19 @@ interface GeneratedReview {
   agentName: string;
   modelName: string;
   content: string;
+  metrics: ActionMetrics;
+}
+
+interface ActionMetrics {
+  startedAt: string;
+  completedAt: string;
+  elapsedMs: number;
+  generationMs: number;
+  promptTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  promptCharacters: number;
+  outputCharacters: number;
 }
 
 interface SelectedPrContext {
@@ -108,6 +121,7 @@ interface ActionOutputMetadata {
   engine: ReviewEngine;
   agentName: string;
   modelName: string;
+  metrics: ActionMetrics;
   prompt: string;
   inputValues: Record<string, string>;
   generatedOutput?: string;
@@ -287,6 +301,8 @@ async function executeWorkflowGeneration(
     onStatus?: (status: string) => void;
   } = {}
 ): Promise<{ metadata: ActionOutputMetadata; outputFile: vscode.Uri; reasoningFile: vscode.Uri; output: string }> {
+  const workflowStartedAtMs = Date.now();
+  const workflowStartedAt = new Date(workflowStartedAtMs).toISOString();
   const promptTemplate = workflow.promptTemplate?.trim();
   if (!promptTemplate) {
     throw new Error(`Missing promptTemplate in workflow '${workflow.id}'.`);
@@ -301,7 +317,7 @@ async function executeWorkflowGeneration(
 
   const liveReasoningFile = await createTransientReasoningFile();
   const liveReasoningPayload: Record<string, unknown> = {
-    timestamp: new Date().toISOString(),
+    timestamp: workflowStartedAt,
     status: "running",
     phase: "generating",
     workflowId: workflow.id,
@@ -310,6 +326,10 @@ async function executeWorkflowGeneration(
     pullRequestDraft,
     reasoningEffort,
     engine,
+    metrics: {
+      startedAt: workflowStartedAt,
+      promptCharacters: prompt.length
+    },
     prompt,
     inputValues: resolved.values,
     prContext: resolved.prContext,
@@ -339,6 +359,13 @@ async function executeWorkflowGeneration(
   pullRequestDraft = workflow.id === "create-pr" || workflow.type === "create-pr" ? parsePullRequestDraft(generated.content) : undefined;
 
   options.onStatus?.(`Saving ${workflow.title} output`);
+  const workflowCompletedAtMs = Date.now();
+  const metrics: ActionMetrics = {
+    ...generated.metrics,
+    startedAt: workflowStartedAt,
+    completedAt: new Date(workflowCompletedAtMs).toISOString(),
+    elapsedMs: workflowCompletedAtMs - workflowStartedAtMs
+  };
   const output = renderOutputWithExecutionInfo(
     workflow.id === "create-pr" || workflow.type === "create-pr"
       ? renderPullRequestDraftOutput(generated.content, pullRequestDraft)
@@ -346,7 +373,8 @@ async function executeWorkflowGeneration(
     {
       agentName: generated.agentName,
       modelName: generated.modelName,
-      reasoningEffort
+      reasoningEffort,
+      metrics
     }
   );
   const outputFile = await writeOutputFile(
@@ -368,6 +396,7 @@ async function executeWorkflowGeneration(
     engine,
     agentName: generated.agentName,
     modelName: generated.modelName,
+    metrics,
     prompt,
     inputValues: resolved.values,
     prContext: resolved.prContext,
@@ -391,6 +420,7 @@ async function executeWorkflowGeneration(
     engine,
     agentName: generated.agentName,
     modelName: generated.modelName,
+    metrics,
     prompt,
     inputValues: resolved.values,
     generatedOutput: output,
@@ -2069,16 +2099,11 @@ async function generateWithLanguageModel(
 }
 
 async function tryGenerateWithVsCodeLm(prompt: string, options: GenerationOptions = {}): Promise<GeneratedReview | undefined> {
+  const generationStartedAtMs = Date.now();
+  const generationStartedAt = new Date(generationStartedAtMs).toISOString();
   const model = options.model ?? (await resolveConfiguredLanguageModel());
   if (!model) {
-    const selector = getConfiguredLanguageModelSelector();
-    if (selector) {
-      throw new Error(
-        `The configured VS Code chat model is unavailable: ${formatLanguageModelSelector(selector)}. Choose another model in CMSIS-Dev settings.`
-      );
-    }
-
-    throw new Error("No VS Code chat model is available for CMSIS-Dev. Configure a provider in the Language Models view.");
+    throw new Error("No VS Code chat model is available for CMSIS-Dev. Select a model in Chat or configure a provider in the Language Models view.");
   }
 
   const modelLabel = formatLanguageModelLabel(model);
@@ -2088,6 +2113,7 @@ async function tryGenerateWithVsCodeLm(prompt: string, options: GenerationOption
   );
 
   try {
+    const promptTokens = await countLanguageModelTokens(model, prompt);
     const response = await model.sendRequest(
       [vscode.LanguageModelChatMessage.User(prompt)],
       {
@@ -2104,15 +2130,40 @@ async function tryGenerateWithVsCodeLm(prompt: string, options: GenerationOption
     }
 
     const normalized = content.trim();
+    const generationCompletedAtMs = Date.now();
+    const outputTokens = normalized ? await countLanguageModelTokens(model, normalized) : undefined;
+    const metrics: ActionMetrics = {
+      startedAt: generationStartedAt,
+      completedAt: new Date(generationCompletedAtMs).toISOString(),
+      elapsedMs: generationCompletedAtMs - generationStartedAtMs,
+      generationMs: generationCompletedAtMs - generationStartedAtMs,
+      promptTokens,
+      outputTokens,
+      totalTokens:
+        typeof promptTokens === "number" || typeof outputTokens === "number"
+          ? (promptTokens ?? 0) + (outputTokens ?? 0)
+          : undefined,
+      promptCharacters: prompt.length,
+      outputCharacters: normalized.length
+    };
     return normalized
       ? {
           agentName: "VS Code Chat",
           modelName: modelLabel,
-          content: normalized
+          content: normalized,
+          metrics
         }
       : undefined;
   } catch (error) {
     throw new Error(describeLanguageModelError(error));
+  }
+}
+
+async function countLanguageModelTokens(model: vscode.LanguageModelChat, text: string): Promise<number | undefined> {
+  try {
+    return await model.countTokens(text);
+  } catch {
+    return undefined;
   }
 }
 
@@ -2523,6 +2574,16 @@ function renderReasoningMarkdown(payload: Record<string, unknown>): string {
   appendField("Output File", payload.outputFile);
   appendField("Reasoning File", payload.reasoningFile);
 
+  const metrics = payload.metrics;
+  if (metrics !== undefined) {
+    lines.push("");
+    lines.push("## Metrics");
+    lines.push("");
+    lines.push("```json");
+    lines.push(JSON.stringify(metrics, null, 2));
+    lines.push("```");
+  }
+
   const prompt = typeof payload.prompt === "string" ? payload.prompt : undefined;
   if (prompt) {
     lines.push("");
@@ -2598,13 +2659,44 @@ function renderReasoningMarkdown(payload: Record<string, unknown>): string {
 
 function renderOutputWithExecutionInfo(
   content: string,
-  details: { agentName: string; modelName: string; reasoningEffort?: CmsisDevReasoningEffort }
+  details: { agentName: string; modelName: string; reasoningEffort?: CmsisDevReasoningEffort; metrics?: ActionMetrics }
 ): string {
   return [
     `> Interface: **${details.agentName}**`,
     `> Model: **${details.modelName}**`,
     ...(details.reasoningEffort ? [`> Reasoning Effort: **${details.reasoningEffort}**`] : []),
+    ...(details.metrics ? [`> Metrics: ${formatActionMetricsSummary(details.metrics)}`] : []),
     "",
     content.trim()
   ].join("\n");
+}
+
+function formatActionMetricsSummary(metrics: ActionMetrics): string {
+  const parts = [formatDuration(metrics.elapsedMs)];
+  if (typeof metrics.promptTokens === "number") {
+    parts.push(`${formatInteger(metrics.promptTokens)} input tokens`);
+  }
+  if (typeof metrics.outputTokens === "number") {
+    parts.push(`${formatInteger(metrics.outputTokens)} output tokens`);
+  }
+  if (typeof metrics.totalTokens === "number") {
+    parts.push(`${formatInteger(metrics.totalTokens)} total tokens`);
+  }
+  return parts.join(" | ");
+}
+
+function formatDuration(durationMs: number): string {
+  if (!Number.isFinite(durationMs) || durationMs < 0) {
+    return "unknown duration";
+  }
+
+  if (durationMs < 1000) {
+    return `${Math.round(durationMs)}ms`;
+  }
+
+  return `${(durationMs / 1000).toFixed(durationMs < 10_000 ? 1 : 0)}s`;
+}
+
+function formatInteger(value: number): string {
+  return Math.round(value).toLocaleString("en-US");
 }

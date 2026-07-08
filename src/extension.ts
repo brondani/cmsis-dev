@@ -3,13 +3,6 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { ActionsProvider } from "./actionsProvider";
-import {
-  describeAiSettings,
-  formatLanguageModelLabel,
-  getConfiguredLanguageModelSelector,
-  listAvailableLanguageModels,
-  updateConfiguredLanguageModelSelector
-} from "./aiSettings";
 import { openWorkflowInChat, registerCmsisDevChatParticipant } from "./chatParticipant";
 import {
   manageCmsisDevLanguageModelProvider,
@@ -37,10 +30,8 @@ import {
   openPrForOutputUri,
   openReasoningForActiveOutput,
   openReasoningForOutputUri,
-  PromptWorkflowResult,
   postCommentForActiveOutput,
   postCommentForOutputUri,
-  runPromptWorkflow,
   submitPrForActiveOutput,
   submitPrForOutputUri
 } from "./workflows/promptWorkflow";
@@ -104,15 +95,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.window.onDidChangeActiveTextEditor((editor) => {
       void updateActiveOutputContexts(editor);
     }),
-    vscode.workspace.onDidChangeConfiguration((event) => {
-      if (
-        event.affectsConfiguration("cmsisDev.languageModelSelector") ||
-        event.affectsConfiguration("cmsisDev.languageModelProvider.baseUrl") ||
-        event.affectsConfiguration("cmsisDev.reasoningEffort")
-      ) {
-        void updateActionsViewDescription(actionsTreeView);
-      }
-    }),
     actionsTreeView,
     vscode.window.registerTreeDataProvider("cmsisDev.workflows", workflowsProvider),
     runsTreeView,
@@ -121,14 +103,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await initializeWorkflowConfig();
       await provider.refresh();
       await workflowsProvider.refresh();
-      await runsProvider.refresh();
-    }),
-    vscode.commands.registerCommand("cmsisDev.runAction", async (workflow?: WorkflowDefinition) => {
-      const chosen = workflow ?? (await chooseWorkflow(provider));
-      if (!chosen) {
-        return;
-      }
-      await runWorkflowWithStatus(chosen);
       await runsProvider.refresh();
     }),
     vscode.commands.registerCommand("cmsisDev.runActionInChat", async (workflow?: WorkflowDefinition) => {
@@ -148,8 +122,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.window.showWarningMessage("The 'Plan Next Steps' workflow is not available.");
         return;
       }
-      await runWorkflowWithStatus(workflow, { presetRunOutputUri: targetUri });
-      await runsProvider.refresh();
+      await openWorkflowInChat(workflow, { presetRunOutputUri: targetUri });
     }),
     vscode.commands.registerCommand("cmsisDev.attachRunOutputToChat", async (item?: unknown) => {
       const targetUri = resolveRunOutputUri(item);
@@ -250,9 +223,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("cmsisDev.refreshWorkflows", async () => {
       await workflowsProvider.refresh();
     }),
-    vscode.commands.registerCommand("cmsisDev.selectLanguageModel", async () => {
-      await selectLanguageModel(actionsTreeView);
-    }),
     vscode.commands.registerCommand("cmsisDev.selectReasoningEffort", async () => {
       await selectReasoningEffort(actionsTreeView);
     }),
@@ -261,14 +231,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.commands.registerCommand("cmsisDev.manageLanguageModelProvider", async () => {
       await manageCmsisDevLanguageModelProvider(languageModelProvider);
-      await updateActionsViewDescription(actionsTreeView);
     }),
     vscode.commands.registerCommand("cmsisDev.manageGitHubToken", async () => {
       await manageGitHubToken();
     }),
     vscode.commands.registerCommand("cmsisDev.refreshLanguageModelProvider", async () => {
       await refreshCmsisDevLanguageModelProvider(languageModelProvider);
-      await updateActionsViewDescription(actionsTreeView);
     }),
     vscode.commands.registerCommand("cmsisDev.setGitHubToken", async () => {
       const token = await vscode.window.showInputBox({
@@ -313,7 +281,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   await provider.refresh();
-  await updateActionsViewDescription(actionsTreeView);
   await workflowsProvider.refresh();
   await runsProvider.refresh();
   await refreshWorkflowDiagnostics(workflowDiagnostics);
@@ -428,111 +395,13 @@ async function resolveWorkflowById(workflowId: string): Promise<WorkflowDefiniti
   return workflows.find((workflow) => workflow.id === workflowId);
 }
 
-async function runWorkflow(
-  workflow: WorkflowDefinition,
-  options: {
-    onStatus?: (status: string) => void;
-    presetRunOutputUri?: vscode.Uri;
-  } = {}
-): Promise<PromptWorkflowResult> {
-  return runPromptWorkflow(workflow, options);
-}
-
-async function runWorkflowWithStatus(
-  workflow: WorkflowDefinition,
-  options: {
-    presetRunOutputUri?: vscode.Uri;
-  } = {}
-): Promise<void> {
-  const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-  statusBar.name = "CMSIS-Dev AI Action";
-  statusBar.text = `$(sync~spin) CMSIS-Dev: Running ${workflow.title}`;
-  statusBar.show();
-  let dismissAfterMs = 8000;
-
-  try {
-    const result = await runWorkflow(workflow, {
-      onStatus: (status) => {
-        statusBar.text = `$(sync~spin) CMSIS-Dev: ${status}`;
-      },
-      presetRunOutputUri: options.presetRunOutputUri
-    });
-
-    if (result.canceled) {
-      statusBar.text = `$(circle-slash) CMSIS-Dev: Cancelled ${workflow.title}`;
-      dismissAfterMs = 2500;
-    } else {
-      statusBar.text = result.handedOffToChat
-        ? `$(comment-discussion) CMSIS-Dev: Waiting in Chat for ${workflow.title}`
-        : `$(check) CMSIS-Dev: Completed ${workflow.title}`;
-      dismissAfterMs = result.handedOffToChat ? 30000 : 8000;
-    }
-  } catch (error) {
-    statusBar.text = `$(error) CMSIS-Dev: Failed ${workflow.title}`;
-    const message = error instanceof Error ? error.message : String(error);
-    vscode.window.showErrorMessage(`AI action '${workflow.title}' failed: ${message}`);
-    dismissAfterMs = 8000;
-    throw error;
-  } finally {
-    setTimeout(() => {
-      statusBar.hide();
-      statusBar.dispose();
-    }, dismissAfterMs);
-  }
-}
-
 async function updateActionsViewDescription(actionsTreeView: vscode.TreeView<unknown>): Promise<void> {
-  actionsTreeView.description = await describeAiSettings();
-}
-
-async function selectLanguageModel(actionsTreeView: vscode.TreeView<unknown>): Promise<void> {
-  const configuredSelector = getConfiguredLanguageModelSelector();
-  const availableModels = await listAvailableLanguageModels();
-  const selected = await vscode.window.showQuickPick(
-    [
-      {
-        label: "Automatic",
-        description: !configuredSelector ? "Current selection" : undefined,
-        detail: "Use the first available VS Code chat model.",
-        selector: undefined
-      },
-      ...availableModels.map((model) => ({
-        label: model.name,
-        description:
-          configuredSelector &&
-          configuredSelector.vendor === model.vendor &&
-          configuredSelector.family === model.family &&
-          configuredSelector.version === model.version &&
-          configuredSelector.id === model.id
-            ? "Current selection"
-            : undefined,
-        detail: formatLanguageModelLabel(model),
-        selector: {
-          vendor: model.vendor,
-          family: model.family,
-          version: model.version,
-          id: model.id
-        }
-      }))
-    ],
-    {
-      title: "Select VS Code Language Model",
-      placeHolder:
-        availableModels.length > 0
-          ? "Choose the chat model for CMSIS-Dev actions"
-          : "No VS Code chat models are currently available"
-    }
-  );
-  if (!selected) {
-    return;
-  }
-
-  await updateConfiguredLanguageModelSelector(selected.selector);
-  await updateActionsViewDescription(actionsTreeView);
+  actionsTreeView.description = undefined;
 }
 
 async function selectReasoningEffort(actionsTreeView: vscode.TreeView<unknown>): Promise<void> {
   const configuredEffort = getConfiguredReasoningEffort();
+  const currentReasoningLevel = formatReasoningEffortLabel(configuredEffort);
   const selected = await vscode.window.showQuickPick(
     [
       {
@@ -549,8 +418,8 @@ async function selectReasoningEffort(actionsTreeView: vscode.TreeView<unknown>):
       }))
     ],
     {
-      title: "Select CMSIS-Dev Reasoning Effort",
-      placeHolder: "Choose the default reasoning.effort CMSIS-Dev should send for supported models"
+      title: `Set CMSIS-Dev Reasoning Level (${currentReasoningLevel})`,
+      placeHolder: "Choose the reasoning.effort value CMSIS-Dev should send for supported models"
     }
   );
   if (!selected) {
@@ -631,7 +500,6 @@ async function configureIntegrations(
 
   if (selected.action === "provider") {
     await manageCmsisDevLanguageModelProvider(languageModelProvider);
-    await updateActionsViewDescription(actionsTreeView);
     return;
   }
 

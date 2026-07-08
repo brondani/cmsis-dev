@@ -8,7 +8,7 @@ const CHAT_PARTICIPANT_ID = "cmsis-dev.chat";
 const CHAT_PARTICIPANT_NAME = "cmsisdev";
 const STATIC_CHAT_COMMANDS = new Set(["review-pr", "review-changes", "create-pr", "explain-issue", "explain-ci-failure", "plan-next-steps"]);
 
-let pendingWorkflowForChat: WorkflowDefinition | undefined;
+let pendingChatRun: { workflow: WorkflowDefinition; presetRunOutputUri?: vscode.Uri } | undefined;
 
 export function registerCmsisDevChatParticipant(context: vscode.ExtensionContext): vscode.Disposable {
   const participant = vscode.chat.createChatParticipant(CHAT_PARTICIPANT_ID, async (request, _chatContext, response, token) => {
@@ -16,18 +16,20 @@ export function registerCmsisDevChatParticipant(context: vscode.ExtensionContext
     if (!workflow) {
       response.markdown(buildHelpMarkdown());
       response.button({
-        command: "cmsisDev.runAction",
-        title: "Run from Actions"
+        command: "cmsisDev.runActionInChat",
+        title: "Run AI Action in Chat"
       });
       return;
     }
 
+    const pendingOptions = consumePendingChatRun(workflow.id);
     const additionalInstructions = request.prompt.trim();
     response.progress(`Running ${workflow.title}`);
     const execution = await runPromptWorkflowInChat(workflow, {
       additionalInstructions: additionalInstructions.length > 0 ? additionalInstructions : undefined,
       model: request.model,
-      onStatus: (status) => response.progress(status)
+      onStatus: (status) => response.progress(status),
+      presetRunOutputUri: pendingOptions?.presetRunOutputUri
     });
 
     if (!execution) {
@@ -52,8 +54,7 @@ export function registerCmsisDevChatParticipant(context: vscode.ExtensionContext
 async function resolveWorkflowForChatRequest(request: vscode.ChatRequest): Promise<WorkflowDefinition | undefined> {
   const workflows = await loadWorkflowDefinitions();
   if (request.command === "run") {
-    const pending = pendingWorkflowForChat;
-    pendingWorkflowForChat = undefined;
+    const pending = pendingChatRun?.workflow;
     if (pending) {
       return workflows.find((workflow) => workflow.id === pending.id) ?? pending;
     }
@@ -68,13 +69,26 @@ async function resolveWorkflowForChatRequest(request: vscode.ChatRequest): Promi
   return undefined;
 }
 
-export async function openWorkflowInChat(workflow: WorkflowDefinition): Promise<void> {
+export async function openWorkflowInChat(
+  workflow: WorkflowDefinition,
+  options: { presetRunOutputUri?: vscode.Uri } = {}
+): Promise<void> {
   const command = STATIC_CHAT_COMMANDS.has(workflow.id) ? workflow.id : "run";
-  pendingWorkflowForChat = command === "run" ? workflow : undefined;
+  pendingChatRun = { workflow, presetRunOutputUri: options.presetRunOutputUri };
   await vscode.commands.executeCommand("workbench.action.chat.open", {
     query: `@${CHAT_PARTICIPANT_NAME} /${command}`,
     isPartialQuery: false
   });
+}
+
+function consumePendingChatRun(workflowId: string): { presetRunOutputUri?: vscode.Uri } | undefined {
+  if (pendingChatRun?.workflow.id !== workflowId) {
+    return undefined;
+  }
+
+  const pendingOptions = { presetRunOutputUri: pendingChatRun.presetRunOutputUri };
+  pendingChatRun = undefined;
+  return pendingOptions;
 }
 
 async function chooseWorkflow(workflows: WorkflowDefinition[]): Promise<WorkflowDefinition | undefined> {

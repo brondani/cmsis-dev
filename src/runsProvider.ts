@@ -158,7 +158,12 @@ function toRunOutputContextValue(followUpState: {
   if (followUpState.canSubmitPr) {
     tokens.push("canSubmitPr");
   }
-  if (metadata?.workflowId === "review-pr" || metadata?.workflowId === "review-changes" || metadata?.workflowId === "explain-issue") {
+  if (
+    metadata?.workflowId === "review-pr" ||
+    metadata?.workflowId === "review-changes" ||
+    metadata?.workflowId === "explain-issue" ||
+    metadata?.workflowId === "explain-ci-failure"
+  ) {
     tokens.push("canPlanNextSteps");
   }
   if (metadata?.workflowId === "plan-next-steps") {

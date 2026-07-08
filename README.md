@@ -47,7 +47,7 @@ CMSIS-Dev is a basic VS Code extension scaffold that provides:
 3. The extension fetches PR metadata + changed files from GitHub API.
 4. It builds a detailed review prompt for code review.
 5. It shows progress in the status bar during selection, fetch, generation, and save phases.
-6. The extension runs the workflow through VS Code's language model system and the configured chat model.
+6. The extension runs the workflow through VS Code Chat using the model selected in the Chat sidebar.
 7. Output files are saved only after the review text has actually been generated.
 8. The review draft is saved to `.cmsis-dev/runs/...md` and copied to clipboard.
 9. A reasoning log (prompt, metadata, and generated output) is written as a persistent sidecar markdown file and can be opened from the completion notification.
@@ -142,23 +142,22 @@ Use VS Code SecretStorage commands (no plaintext settings):
 Settings:
 
 - `cmsisDev.workflowConfigPath`: workspace workflow override directory path (default `.cmsis-dev/workflows`).
-- `cmsisDev.languageModelSelector`: optional VS Code language model selector saved by the `CMSIS-Dev: Set VS Code Model` command.
 - `cmsisDev.languageModelProvider.baseUrl`: OpenAI-compatible `v1` base URL used by the built-in CMSIS-Dev model provider.
 
-The `Actions` view title shows the effective model selection and provides toolbar actions to change it without opening settings.
+The `Actions` view toolbar provides commands to change CMSIS-Dev settings without opening settings. Use `CMSIS-Dev: Set Reasoning Level` to inspect or change the current reasoning level.
 
 Provider setup:
 
 - Run `CMSIS-Dev: Manage Language Model Provider`.
 - Configure the proxy base URL.
 - Set the API key in SecretStorage.
-- Refresh models, then use `CMSIS-Dev: Set VS Code Model` if you want to pin a specific discovered model.
+- Refresh models, then choose the CMSIS-Dev chat model from VS Code's Chat sidebar model picker.
 
 VS Code Chat:
 
 - `@cmsisdev /run` opens a workflow picker inside chat.
 - `@cmsisdev /review-pr`, `/review-changes`, `/create-pr`, and `/explain-issue` run the built-in workflows with the currently selected chat model.
-- `CMSIS-Dev: Run AI Action` remains available for direct non-chat execution from the command palette.
+- `CMSIS-Dev: Run AI Action in Chat` opens the selected workflow in Chat and auto-submits the matching `@cmsisdev` command.
 
 ## Build and run
 
