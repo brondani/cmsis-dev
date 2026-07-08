@@ -10,7 +10,7 @@ import {
   listAvailableLanguageModels,
   updateConfiguredLanguageModelSelector
 } from "./aiSettings";
-import { registerCmsisDevChatParticipant } from "./chatParticipant";
+import { openWorkflowInChat, registerCmsisDevChatParticipant } from "./chatParticipant";
 import {
   manageCmsisDevLanguageModelProvider,
   refreshCmsisDevLanguageModelProvider,
@@ -130,6 +130,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       await runWorkflowWithStatus(chosen);
       await runsProvider.refresh();
+    }),
+    vscode.commands.registerCommand("cmsisDev.runActionInChat", async (workflow?: WorkflowDefinition) => {
+      const chosen = workflow ?? (await chooseWorkflow(provider));
+      if (!chosen) {
+        return;
+      }
+      await openWorkflowInChat(chosen);
     }),
     vscode.commands.registerCommand("cmsisDev.planNextStepsForRunOutput", async (item?: unknown) => {
       const targetUri = resolveRunOutputUri(item);

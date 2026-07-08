@@ -2,7 +2,7 @@
 
 CMSIS-Dev is a basic VS Code extension scaffold that provides:
 
-- An **AI Actions** view in the Explorer for running workflows.
+- An **AI Actions** view in the Explorer for launching workflows in VS Code Chat.
 - Bundled workflow configuration files shipped inside the extension installation.
 - Optional workspace workflow overrides under `.cmsis-dev/workflows/` (one YAML file per action).
 - Dynamic AI actions loaded from bundled defaults plus workspace overrides.
@@ -70,7 +70,8 @@ These enable persistent actions even after notifications disappear.
 - One YAML file per action is the preferred layout.
 - No per-workflow command needs to be added to `package.json`.
 - Use `CMSIS-Dev: Create Workflow Overrides` to scaffold editable workspace copies when needed.
-- Add a new workspace `.yml` file under `.cmsis-dev/workflows/`, refresh the view, and run it from the AI Actions tree.
+- Add a new workspace `.yml` file under `.cmsis-dev/workflows/`, refresh the view, and launch it from the AI Actions tree.
+- Clicking an AI Action opens VS Code Chat and auto-submits the matching `@cmsisdev` command. Dynamic workspace-only actions use the `/run` chat entry point with the selected workflow preselected.
 - Generic workflows run by collecting declared inputs and rendering `promptTemplate`.
 - Reusable input types include:
   - `text`: prompts the user for a value.
@@ -157,6 +158,7 @@ VS Code Chat:
 
 - `@cmsisdev /run` opens a workflow picker inside chat.
 - `@cmsisdev /review-pr`, `/review-changes`, `/create-pr`, and `/explain-issue` run the built-in workflows with the currently selected chat model.
+- `CMSIS-Dev: Run AI Action` remains available for direct non-chat execution from the command palette.
 
 ## Build and run
 

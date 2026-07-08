@@ -8,8 +8,8 @@ export class ActionItem extends vscode.TreeItem {
     this.description = workflow.description;
     this.contextValue = "cmsisDev.action";
     this.command = {
-      command: "cmsisDev.runAction",
-      title: "Run AI Action",
+      command: "cmsisDev.runActionInChat",
+      title: "Run AI Action in Chat",
       arguments: [workflow]
     };
   }

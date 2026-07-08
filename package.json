@@ -25,6 +25,7 @@
     "onView:cmsisDev.workflows",
     "onView:cmsisDev.runs",
     "onCommand:cmsisDev.runAction",
+    "onCommand:cmsisDev.runActionInChat",
     "onCommand:cmsisDev.initializeWorkflows",
     "onCommand:cmsisDev.refreshWorkflows",
     "onCommand:cmsisDev.refreshRuns",
@@ -58,6 +59,10 @@
       {
         "command": "cmsisDev.runAction",
         "title": "CMSIS-Dev: Run AI Action"
+      },
+      {
+        "command": "cmsisDev.runActionInChat",
+        "title": "CMSIS-Dev: Run AI Action in Chat"
       },
       {
         "command": "cmsisDev.initializeWorkflows",

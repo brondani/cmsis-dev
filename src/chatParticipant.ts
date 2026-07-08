@@ -5,6 +5,10 @@ import { WorkflowDefinition } from "./types";
 import { runPromptWorkflowInChat } from "./workflows/promptWorkflow";
 
 const CHAT_PARTICIPANT_ID = "cmsis-dev.chat";
+const CHAT_PARTICIPANT_NAME = "cmsisdev";
+const STATIC_CHAT_COMMANDS = new Set(["review-pr", "review-changes", "create-pr", "explain-issue", "explain-ci-failure", "plan-next-steps"]);
+
+let pendingWorkflowForChat: WorkflowDefinition | undefined;
 
 export function registerCmsisDevChatParticipant(context: vscode.ExtensionContext): vscode.Disposable {
   const participant = vscode.chat.createChatParticipant(CHAT_PARTICIPANT_ID, async (request, _chatContext, response, token) => {
@@ -48,6 +52,12 @@ export function registerCmsisDevChatParticipant(context: vscode.ExtensionContext
 async function resolveWorkflowForChatRequest(request: vscode.ChatRequest): Promise<WorkflowDefinition | undefined> {
   const workflows = await loadWorkflowDefinitions();
   if (request.command === "run") {
+    const pending = pendingWorkflowForChat;
+    pendingWorkflowForChat = undefined;
+    if (pending) {
+      return workflows.find((workflow) => workflow.id === pending.id) ?? pending;
+    }
+
     return chooseWorkflow(workflows);
   }
 
@@ -56,6 +66,15 @@ async function resolveWorkflowForChatRequest(request: vscode.ChatRequest): Promi
   }
 
   return undefined;
+}
+
+export async function openWorkflowInChat(workflow: WorkflowDefinition): Promise<void> {
+  const command = STATIC_CHAT_COMMANDS.has(workflow.id) ? workflow.id : "run";
+  pendingWorkflowForChat = command === "run" ? workflow : undefined;
+  await vscode.commands.executeCommand("workbench.action.chat.open", {
+    query: `@${CHAT_PARTICIPANT_NAME} /${command}`,
+    isPartialQuery: false
+  });
 }
 
 async function chooseWorkflow(workflows: WorkflowDefinition[]): Promise<WorkflowDefinition | undefined> {
