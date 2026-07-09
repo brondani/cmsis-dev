@@ -18,7 +18,7 @@ promptTemplate: |
   Use the committed branch diff as the main source of truth.
   Do not include uncommitted or untracked working tree changes.
   If a previous "Review Changes" result is available, use it only to improve clarity and coverage.
-  If repository pull request templates are available, follow their structure but keep the result concise and remove empty sections.
+  Consider the repository pull request templates listed below. If multiple templates are present, select the one that best fits the changes being proposed and follow its structure. If no templates are present, create a clear and concise PR description that follows best practices.
   Do not invent changes that are not present in the diff.
 
   Return exactly this format:
