@@ -382,6 +382,8 @@ CMSIS-Dev already stores run metadata such as:
 
 These fields are enough to start measuring the MVP without adding a large analytics system.
 
+The VS Code Chat Diagnostics view separately reports recent proxy request usage by chat session, including internal requests. Its token totals cover retained requests only: cached tokens are included in input, reasoning tokens are included in output, and missing provider usage is not treated as zero. Token totals can help investigate usage but are not a monetary cost calculation without model-specific rates.
+
 Recommended MVP metrics:
 
 | Metric | Why it matters |

@@ -1,0 +1,6 @@
+.vscode/**
+src/**
+tsconfig*.json
+.gitignore
+.cmsis-dev/runs/**
+.cmsis-dev/chat-diagnostics/**

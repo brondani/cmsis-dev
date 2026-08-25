@@ -3,6 +3,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { resolveWorkflowRunsDirUri } from "./workflowConfig";
 import { getOutputFollowUpStateForUri } from "./workflows/promptWorkflow";
+export { getRelatedRunFilePaths } from "./runRetentionCore";
 
 interface RunOutputMetadata {
   workflowId?: string;
@@ -57,10 +58,6 @@ class RunsPlaceholderItem extends vscode.TreeItem {
 }
 
 type RunsTreeItem = RunOutputItem | RunsPlaceholderItem;
-
-export function getRelatedRunFilePaths(outputPath: string): string[] {
-  return [outputPath, `${outputPath}.reasoning.md`, `${outputPath}.meta.json`];
-}
 
 export class RunsProvider implements vscode.TreeDataProvider<RunsTreeItem> {
   private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<RunsTreeItem | undefined | null | void>();
@@ -120,12 +117,13 @@ export class RunsProvider implements vscode.TreeDataProvider<RunsTreeItem> {
           })
       );
 
-      return outputs.sort((left, right) => {
+      outputs.sort((left, right) => {
         const modifiedDelta = right.modifiedAt - left.modifiedAt;
         return modifiedDelta !== 0
           ? modifiedDelta
           : path.basename(left.uri.fsPath).localeCompare(path.basename(right.uri.fsPath));
       });
+      return outputs;
     } catch {
       return [];
     }

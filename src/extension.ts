@@ -3,6 +3,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { ActionsProvider } from "./actionsProvider";
+import { ChatDiagnosticsProvider } from "./chatDiagnosticsProvider";
+import { clearOpenChatDiagnosticsTraces, openChatDiagnosticsTrace } from "./chatDiagnosticsTracePanel";
 import { openWorkflowInChat, registerCmsisDevChatParticipant } from "./chatParticipant";
 import {
   manageCmsisDevLanguageModelProvider,
@@ -10,6 +12,7 @@ import {
   registerCmsisDevLanguageModelProvider
 } from "./languageModelProvider";
 import { getRelatedRunFilePaths, RunOutputItem, RunsProvider } from "./runsProvider";
+import { pruneSavedRuns } from "./runRetention";
 import { clearGitHubToken, getGitHubToken, initializeSecretStorage, setGitHubToken } from "./secrets";
 import { WorkflowDefinition } from "./types";
 import { createWorkflowDiagnosticCollection, refreshWorkflowDiagnostics, validateWorkflowTextDocument } from "./workflowDiagnostics";
@@ -43,8 +46,39 @@ import {
   getConfiguredReasoningEffort,
   updateConfiguredReasoningEffort
 } from "./reasoningEffort";
+import { ChatConversationDiagnostic, ChatRequestDiagnostic, resolveChatRequestDiagnostic } from "./requestDiagnostics";
 
 let mcpProcess: cp.ChildProcess | undefined;
+
+function chatDiagnosticUri(diagnostic: ChatRequestDiagnostic): vscode.Uri {
+  return vscode.Uri.from({
+    scheme: "cmsis-dev-chat-diagnostic",
+    path: `/${diagnostic.conversationId}/${diagnostic.id}.json`,
+    query: `startedAt=${encodeURIComponent(String(diagnostic.metadata.startedAt ?? diagnostic.metadata.timestamp ?? ""))}`
+  });
+}
+
+async function showChatDiagnosticDocument(document: vscode.TextDocument): Promise<void> {
+  const group = vscode.window.tabGroups.all.find((candidate) => candidate.tabs.some((tab) =>
+    tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === document.uri.toString()
+  ));
+  await vscode.window.showTextDocument(document, { preview: false, viewColumn: group?.viewColumn });
+}
+
+function resolveChatConversationDiagnostic(value: unknown): ChatConversationDiagnostic | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const candidate = value as Record<string, unknown>;
+  const conversation = candidate.conversation ?? candidate;
+  if (!conversation || typeof conversation !== "object") {
+    return undefined;
+  }
+  const record = conversation as Record<string, unknown>;
+  return typeof record.label === "string" && Array.isArray(record.requests)
+    ? conversation as ChatConversationDiagnostic
+    : undefined;
+}
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   let disposed = false;
@@ -56,6 +90,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   initializeSecretStorage(context.secrets);
   const languageModelProvider = registerCmsisDevLanguageModelProvider(context);
+  await languageModelProvider.initializeChatDiagnostics();
   const provider = new ActionsProvider();
   const actionsTreeView = vscode.window.createTreeView("cmsisDev.actions", {
     treeDataProvider: provider
@@ -64,6 +99,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const runsTreeView = vscode.window.createTreeView("cmsisDev.runs", {
     treeDataProvider: runsProvider,
     canSelectMany: true
+  });
+  const chatDiagnosticsProvider = new ChatDiagnosticsProvider(languageModelProvider.chatDiagnostics);
+  const chatDiagnosticsTreeView = vscode.window.createTreeView("cmsisDev.chatDiagnostics", {
+    treeDataProvider: chatDiagnosticsProvider
+  });
+  const chatDiagnosticContents = new Map<string, string>();
+  const chatDiagnosticChanged = new vscode.EventEmitter<vscode.Uri>();
+  const chatDiagnosticContentProvider = vscode.workspace.registerTextDocumentContentProvider("cmsis-dev-chat-diagnostic", {
+    onDidChange: chatDiagnosticChanged.event,
+    provideTextDocumentContent: (uri) => chatDiagnosticContents.get(uri.toString()) ?? ""
   });
   const workflowsProvider = new WorkflowsProvider();
   const workflowDiagnostics = createWorkflowDiagnosticCollection();
@@ -74,9 +119,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       workflowWatcher.dispose();
     }
     runsWatcher?.dispose();
+    chatDiagnosticChanged.dispose();
+    chatDiagnosticContentProvider.dispose();
     workflowDiagnostics.dispose();
     actionsTreeView.dispose();
     runsTreeView.dispose();
+    chatDiagnosticsProvider.dispose();
+    chatDiagnosticsTreeView.dispose();
     return;
   }
 
@@ -102,6 +151,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 
   context.subscriptions.push(
+    chatDiagnosticChanged,
+    chatDiagnosticContentProvider,
+    vscode.workspace.onDidCloseTextDocument((document) => {
+      if (document.uri.scheme === "cmsis-dev-chat-diagnostic") {
+        chatDiagnosticContents.delete(document.uri.toString());
+      }
+    }),
     workflowDiagnostics,
     ...workflowWatchers,
     ...(runsWatcher ? [runsWatcher] : []),
@@ -114,9 +170,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.window.onDidChangeActiveTextEditor((editor) => {
       void updateActiveOutputContexts(editor, runsProvider, runsTreeView);
     }),
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration("cmsisDev.maxRetainedRuns")) {
+        void pruneSavedRuns().then(() => runsProvider.refresh());
+      }
+    }),
     actionsTreeView,
+    chatDiagnosticsProvider,
     vscode.window.registerTreeDataProvider("cmsisDev.workflows", workflowsProvider),
     runsTreeView,
+    chatDiagnosticsTreeView,
     registerCmsisDevChatParticipant(context),
     vscode.commands.registerCommand("cmsisDev.initializeWorkflows", async () => {
       await initializeWorkflowConfig();
@@ -178,6 +241,50 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.commands.registerCommand("cmsisDev.refreshRuns", async () => {
       await runsProvider.refresh();
+    }),
+    vscode.commands.registerCommand("cmsisDev.refreshChatDiagnostics", () => {
+      chatDiagnosticsProvider.refresh();
+    }),
+    vscode.commands.registerCommand("cmsisDev.clearChatDiagnostics", async () => {
+      try {
+        clearOpenChatDiagnosticsTraces();
+        await languageModelProvider.clearChatDiagnostics();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        vscode.window.showErrorMessage(`Failed to clear chat diagnostics: ${message}`);
+      }
+    }),
+    vscode.commands.registerCommand("cmsisDev.openChatDiagnosticsTrace", (value: unknown) => {
+      const conversation = resolveChatConversationDiagnostic(value);
+      if (!conversation) {
+        vscode.window.showWarningMessage("Could not resolve the selected chat session trace.");
+        return;
+      }
+      openChatDiagnosticsTrace(conversation);
+    }),
+    vscode.commands.registerCommand("cmsisDev.openChatDiagnostic", async (diagnostic: unknown) => {
+      const details = resolveChatRequestDiagnostic(diagnostic);
+      if (!details) {
+        vscode.window.showWarningMessage("Could not resolve the selected chat diagnostic.");
+        return;
+      }
+      if (details.fullDiagnosticsPath) {
+        const document = await vscode.workspace.openTextDocument(vscode.Uri.file(details.fullDiagnosticsPath));
+        await showChatDiagnosticDocument(document);
+        return;
+      }
+      const uri = chatDiagnosticUri(details);
+      const content = `${JSON.stringify({
+        chatSession: details.conversationLabel,
+        diagnosticsLevel: details.diagnosticsLevel,
+        ...details.metadata
+      }, null, 2)}\n`;
+      if (chatDiagnosticContents.get(uri.toString()) !== content) {
+        chatDiagnosticContents.set(uri.toString(), content);
+        chatDiagnosticChanged.fire(uri);
+      }
+      const document = await vscode.workspace.openTextDocument(uri);
+      await showChatDiagnosticDocument(document);
     }),
     vscode.commands.registerCommand("cmsisDev.openRunOutputPreview", async (uri: unknown) => {
       const targetUri = toFileUri(uri);
@@ -325,6 +432,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   await provider.refresh();
   await workflowsProvider.refresh();
+  await pruneSavedRuns();
   await runsProvider.refresh();
   await refreshWorkflowDiagnostics(workflowDiagnostics);
   for (const document of vscode.workspace.textDocuments) {

@@ -2,7 +2,7 @@
   "name": "cmsis-dev",
   "displayName": "CMSIS-Dev",
   "description": "CMSIS development helper extension with AI workflows and an MCP server.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "cmsis-dev",
   "icon": "media/arm.png",
   "repository": {
@@ -76,6 +76,26 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "cmsisDev.refreshChatDiagnostics",
+        "title": "CMSIS-Dev: Refresh Chat Diagnostics",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "cmsisDev.clearChatDiagnostics",
+        "title": "CMSIS-Dev: Clear Chat Diagnostics",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "cmsisDev.openChatDiagnostic",
+        "title": "CMSIS-Dev: Open Chat Diagnostic",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "cmsisDev.openChatDiagnosticsTrace",
+        "title": "CMSIS-Dev: Open Chat Session Trace",
+        "icon": "$(graph-line)"
+      },
+      {
         "command": "cmsisDev.deleteRuns",
         "title": "CMSIS-Dev: Delete Runs",
         "icon": "$(trash)"
@@ -145,6 +165,10 @@
           "name": "Runs"
         },
         {
+          "id": "cmsisDev.chatDiagnostics",
+          "name": "Chat Diagnostics"
+        },
+        {
           "id": "cmsisDev.workflows",
           "name": "Workflows",
           "visibility": "collapsed"
@@ -177,6 +201,16 @@
           "command": "cmsisDev.refreshRuns",
           "when": "view == cmsisDev.runs",
           "group": "navigation"
+        },
+        {
+          "command": "cmsisDev.refreshChatDiagnostics",
+          "when": "view == cmsisDev.chatDiagnostics",
+          "group": "navigation"
+        },
+        {
+          "command": "cmsisDev.clearChatDiagnostics",
+          "when": "view == cmsisDev.chatDiagnostics",
+          "group": "navigation"
         }
       ],
       "scm/title": [
@@ -192,6 +226,16 @@
         }
       ],
       "view/item/context": [
+        {
+          "command": "cmsisDev.openChatDiagnosticsTrace",
+          "when": "view == cmsisDev.chatDiagnostics && viewItem == cmsisDev.chatConversation",
+          "group": "inline@1"
+        },
+        {
+          "command": "cmsisDev.openChatDiagnostic",
+          "when": "view == cmsisDev.chatDiagnostics && viewItem =~ /^cmsisDev\\.chatDiagnostic/",
+          "group": "inline@1"
+        },
         {
           "command": "cmsisDev.openPrForActiveOutput",
           "when": "view == cmsisDev.runs && viewItem =~ /(^|\\.)canOpenPr(\\.|$)/",
@@ -342,6 +386,12 @@
           "default": ".cmsis-dev/workflows",
           "description": "Relative path to the workflow configuration directory."
         },
+        "cmsisDev.maxRetainedRuns": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10,
+          "description": "Maximum number of recent workflow runs retained in the Runs view and on disk, including each run's reasoning and metadata files."
+        },
         "cmsisDev.reasoningEffort": {
           "type": "string",
           "enum": [
@@ -368,19 +418,48 @@
           "type": "number",
           "default": 16384,
           "description": "Fallback maximum output token count used when the provider model catalog does not report one."
+        },
+        "cmsisDev.languageModelProvider.requestDiagnostics": {
+          "type": "string",
+          "enum": [
+            "off",
+            "metadata",
+            "full"
+          ],
+          "enumDescriptions": [
+            "Disable proxy request diagnostics.",
+            "Write token usage and privacy-safe request size metadata to the CMSIS-Dev Proxy Usage output channel and the workspace diagnostics history.",
+            "Also store complete request and response JSON in the workspace diagnostics directory. Full diagnostics may contain prompts, source code, tool results, and other sensitive workspace data."
+          ],
+          "default": "metadata",
+          "markdownDescription": "Controls proxy request diagnostics. Recent chat sessions are restored from `.cmsis-dev/chat-diagnostics`. `full` stores complete request and response data there. Retention is controlled by the maximum diagnostics requests and chat sessions settings. API keys and authorization headers are never stored."
+        },
+        "cmsisDev.languageModelProvider.maxDiagnosticsRequests": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 50,
+          "description": "Maximum number of diagnostics requests retained across chat sessions, and maximum number of complete request files retained when full diagnostics is enabled."
+        },
+        "cmsisDev.languageModelProvider.maxDiagnosticsSessions": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 20,
+          "description": "Maximum number of chat diagnostics sessions retained, including the Internal requests group."
         }
       }
     }
   },
   "scripts": {
+    "clean:build": "node -e \"require('node:fs').rmSync('out', { recursive: true, force: true })\"",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "build:mcp": "tsc -p tsconfig.mcp.json",
+    "build:dev": "npm run clean:build && npm run compile && npm run build:mcp",
     "smoke": "npm run smoke:cli && npm run smoke:mcp",
     "smoke:cli": "node scripts/smoke-cli.js",
     "smoke:mcp": "node scripts/smoke-mcp.js",
-    "package:vsix": "npm run compile && npm run build:mcp && node scripts/package-vsix.js",
-    "vscode:prepublish": "npm run compile && npm run build:mcp"
+    "package:vsix": "node scripts/package-vsix.js",
+    "vscode:prepublish": "npm run build:dev"
   },
   "devDependencies": {
     "@types/node": "^20.16.11",

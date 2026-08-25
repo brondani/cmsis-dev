@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { CMSIS_DEV_LANGUAGE_MODEL_VENDOR } from "./languageModelProvider";
 
-const DEFAULT_LANGUAGE_MODEL_IDS = ["gpt-5.5", "gpt-5.4"] as const;
+const DEFAULT_LANGUAGE_MODEL_IDS = ["gpt-6-luna", "gpt-6-sol", "gpt-6-astra"] as const;
 
 export async function resolveConfiguredLanguageModel(): Promise<vscode.LanguageModelChat | undefined> {
   const providerModels = await vscode.lm.selectChatModels({ vendor: CMSIS_DEV_LANGUAGE_MODEL_VENDOR });

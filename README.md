@@ -12,6 +12,7 @@ CMSIS-Dev is currently an MVP (minimum viable product). It is not published in t
 
 - **Actions view**: launch bundled or workspace-specific AI workflows from the CMSIS-Dev activity bar.
 - **Runs view**: reopen generated outputs, reasoning logs, metadata, and follow-up actions after a workflow finishes.
+- **Chat Diagnostics view**: inspect retained proxy requests by chat session, including timing, reported token usage, and request composition.
 - **VS Code Chat support**: run CMSIS-Dev workflows through the `@cmsisdev` chat participant.
 - **GitHub integration**: fetch pull request, issue, and workflow-run context, then post comments or create draft pull requests when you choose to publish output.
 - **Local git integration**: review working tree changes, draft PR text, and generate commit messages from local repository state.
@@ -53,6 +54,16 @@ Additional commands and settings:
 - `cmsisDev.languageModelProvider.defaultMaxOutputTokens`: fallback maximum output token count when the provider model catalog does not report one.
 
 After configuring the provider API key and refreshing models, choose a CMSIS-Dev model from the VS Code Chat model picker before running workflows.
+
+## Chat diagnostics
+
+The **Chat Diagnostics** view groups recent CMSIS-Dev proxy requests by chat session. Open a session to see its request timeline, peak input size, retained input/cached/output totals, and a chat-versus-internal-request breakdown. Cached tokens are part of input; reported reasoning tokens are part of output. Missing usage remains unavailable, and totals marked as partial omit requests without reported usage. These counts are not a price estimate.
+
+With `full` diagnostics, user turns appear as `Prompt #1`, `Prompt #2`, and so on; tool continuations do not advance the number. Saved prompt labels are restored after a restart. New requests continue the numbering when VS Code supplies earlier chat history and the session can be matched unambiguously. The provider does not receive a guaranteed chat ID, so ambiguous continuations may start a new diagnostic session; older snapshots with trimmed history cannot recover the exact count of discarded turns.
+
+`cmsisDev.languageModelProvider.requestDiagnostics` defaults to `metadata`. Metadata includes request timing, status, reported token usage, and outgoing payload sizes, but not the full prompt and response. Select `full` to retain complete request and response JSON (including potentially sensitive prompts, source code, and tool results) and to enable detailed composition inspection. Select `off` to stop capturing new diagnostics. The **Clear Chat Diagnostics** view action deletes the retained workspace history.
+
+The history is stored in `.cmsis-dev/chat-diagnostics/` in the first local workspace folder and restored on reload; when there is no local workspace, complete request files use the extension log directory instead. Set `cmsisDev.languageModelProvider.maxDiagnosticsRequests` (default 50) and `cmsisDev.languageModelProvider.maxDiagnosticsSessions` (default 20) to positive integers to control retention. The request limit also applies to complete request files; reducing either limit trims existing history immediately. The workspace diagnostics directory is Git-ignored by this repository; add an equivalent rule to other repositories before enabling `full` there.
 
 ## Run workflows
 
@@ -116,6 +127,8 @@ Use **Plan Next Steps** from a previous run output to continue work in chat with
 ## Outputs and follow-up actions
 
 Workflow outputs are saved under `.cmsis-dev/runs/` in the current workspace. PR-related outputs include the pull request number in the filename when available, for example `review-pr-pr-123-<timestamp>.md`.
+
+`cmsisDev.maxRetainedRuns` controls how many recent workflow runs are kept (default 10, minimum 1). On startup, after saving a run, or when the setting changes, older outputs and their related files are removed from disk.
 
 Each run can also include sidecar files:
 

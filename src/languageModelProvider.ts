@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import * as vscode from "vscode";
 import {
   getConfiguredReasoningEffort,
@@ -8,6 +9,14 @@ import {
   getLanguageModelProviderApiKey,
   setLanguageModelProviderApiKey
 } from "./secrets";
+import {
+  buildInputBreakdown,
+  ChatDiagnosticsStore,
+  collectRequestDiagnostics,
+  RequestDiagnosticsLevel,
+  selectStoredRequestDiagnosticsToDelete,
+  stringifyDiagnostics
+} from "./requestDiagnostics";
 
 export const CMSIS_DEV_LANGUAGE_MODEL_VENDOR = "cmsis-dev-openai-proxy";
 export const CMSIS_DEV_LANGUAGE_MODEL_PROVIDER_MANAGEMENT_COMMAND = "cmsisDev.configureIntegrations";
@@ -15,8 +24,12 @@ export const CMSIS_DEV_LANGUAGE_MODEL_PROVIDER_MANAGEMENT_COMMAND = "cmsisDev.co
 const DEFAULT_PROXY_BASE_URL = "https://openai-api-proxy.geo.arm.com/api/providers/openai/v1";
 const DEFAULT_MAX_INPUT_TOKENS = 128000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 16384;
+const DEFAULT_MAX_DIAGNOSTICS_REQUESTS = 50;
+const DEFAULT_MAX_DIAGNOSTICS_SESSIONS = 20;
 const MODEL_ACCESS_CACHE_KEY = "cmsisDev.languageModelProvider.modelAccess";
-const DEFAULT_VISIBLE_MODEL_IDS = new Set(["gpt-5.5", "gpt-5.4"]);
+const DEFAULT_VISIBLE_MODEL_IDS = new Set(["gpt-6-luna", "gpt-6-sol", "gpt-6-astra"]);
+const CHAT_DIAGNOSTICS_DIRECTORY = ".cmsis-dev/chat-diagnostics";
+const CHAT_DIAGNOSTICS_INDEX = "conversations.json";
 
 interface StoredModelAccessState {
   baseUrl: string;
@@ -86,6 +99,13 @@ type OpenAiResponsesInputItem =
       output: string;
     };
 
+interface OpenAiResponsesTool {
+  type: "function";
+  name: string;
+  description: string;
+  parameters: object;
+}
+
 interface OpenAiResponsesResponse {
   output?: Array<{
     type?: string;
@@ -104,6 +124,17 @@ interface OpenAiResponsesResponse {
       text?: string;
     }>;
   }>;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+    input_tokens_details?: {
+      cached_tokens?: number;
+    };
+    output_tokens_details?: {
+      reasoning_tokens?: number;
+    };
+  };
   error?: {
     message?: string;
   };
@@ -113,7 +144,13 @@ export class CmsisDevLanguageModelProvider
   implements vscode.LanguageModelChatProvider<CmsisDevLanguageModelInformation>, vscode.Disposable
 {
   private readonly modelsChangedEmitter = new vscode.EventEmitter<void>();
+  private readonly usageOutput = vscode.window.createOutputChannel("CMSIS-Dev Proxy Usage", { log: true });
+  readonly chatDiagnostics = new ChatDiagnosticsStore(
+    getConfiguredMaxDiagnosticsSessions(),
+    getConfiguredMaxDiagnosticsRequests()
+  );
   readonly onDidChangeLanguageModelChatInformation = this.modelsChangedEmitter.event;
+  private requestSequence = 0;
   private modelCache:
     | {
         fetchedAt: number;
@@ -121,10 +158,23 @@ export class CmsisDevLanguageModelProvider
       }
     | undefined;
   private readonly globalState: vscode.Memento;
+  private readonly requestDiagnosticsUri: vscode.Uri;
+  private readonly chatDiagnosticsDirectoryUri: vscode.Uri | undefined;
+  private readonly chatDiagnosticsIndexUri: vscode.Uri | undefined;
+  private chatDiagnosticsWrite = Promise.resolve();
+  private diagnosticsGeneration = 0;
+  private readonly pendingDiagnosticsFiles = new Set<string>();
   private readonly subscriptions: vscode.Disposable[] = [];
 
-  constructor(globalState: vscode.Memento) {
-    this.globalState = globalState;
+  constructor(context: vscode.ExtensionContext) {
+    this.globalState = context.globalState;
+    this.chatDiagnosticsDirectoryUri = resolveWorkspaceChatDiagnosticsDirectoryUri();
+    this.chatDiagnosticsIndexUri = this.chatDiagnosticsDirectoryUri
+      ? vscode.Uri.joinPath(this.chatDiagnosticsDirectoryUri, CHAT_DIAGNOSTICS_INDEX)
+      : undefined;
+    this.requestDiagnosticsUri = this.chatDiagnosticsDirectoryUri
+      ? vscode.Uri.joinPath(this.chatDiagnosticsDirectoryUri, "requests")
+      : vscode.Uri.joinPath(context.logUri, "proxy-requests");
     this.subscriptions.push(
       vscode.workspace.onDidChangeConfiguration((event) => {
         if (
@@ -134,6 +184,21 @@ export class CmsisDevLanguageModelProvider
         ) {
           this.refresh();
         }
+        if (
+          event.affectsConfiguration("cmsisDev.languageModelProvider.maxDiagnosticsRequests") ||
+          event.affectsConfiguration("cmsisDev.languageModelProvider.maxDiagnosticsSessions")
+        ) {
+          this.chatDiagnostics.setRetentionLimits(
+            getConfiguredMaxDiagnosticsSessions(),
+            getConfiguredMaxDiagnosticsRequests()
+          );
+          void this.persistChatDiagnosticsIndex();
+          void this.trimStoredRequestDiagnostics().catch((error) => {
+            if (!isFileNotFoundError(error)) {
+              this.usageOutput.warn(`Failed to trim request diagnostics: ${describeProviderError(error)}`);
+            }
+          });
+        }
       })
     );
   }
@@ -142,12 +207,55 @@ export class CmsisDevLanguageModelProvider
     for (const disposable of this.subscriptions.splice(0)) {
       disposable.dispose();
     }
+    this.usageOutput.dispose();
     this.modelsChangedEmitter.dispose();
   }
 
   refresh(): void {
     this.modelCache = undefined;
     this.modelsChangedEmitter.fire();
+  }
+
+  async initializeChatDiagnostics(): Promise<void> {
+    if (this.chatDiagnosticsIndexUri) {
+      try {
+        const content = await vscode.workspace.fs.readFile(this.chatDiagnosticsIndexUri);
+        const snapshot = JSON.parse(new TextDecoder().decode(content)) as unknown;
+        if (!(await this.chatDiagnostics.restore(snapshot, this.requestDiagnosticsUri.fsPath))) {
+          this.usageOutput.warn(`Ignored invalid chat diagnostics index: ${this.chatDiagnosticsIndexUri.fsPath}`);
+        } else {
+          await this.persistChatDiagnosticsIndex();
+        }
+      } catch (error) {
+        if (!isFileNotFoundError(error)) {
+          this.usageOutput.warn(`Failed to restore chat diagnostics: ${describeProviderError(error)}`);
+        }
+      }
+    }
+    try {
+      await this.trimStoredRequestDiagnostics();
+    } catch (error) {
+      if (!isFileNotFoundError(error)) {
+        this.usageOutput.warn(`Failed to trim request diagnostics: ${describeProviderError(error)}`);
+      }
+    }
+  }
+
+  async clearChatDiagnostics(): Promise<void> {
+    this.diagnosticsGeneration += 1;
+    this.chatDiagnostics.clear();
+    await this.enqueueChatDiagnosticsWrite(async () => {
+      try {
+        await vscode.workspace.fs.delete(this.chatDiagnosticsDirectoryUri ?? this.requestDiagnosticsUri, {
+          recursive: true,
+          useTrash: false
+        });
+      } catch (error) {
+        if (!isFileNotFoundError(error)) {
+          throw error;
+        }
+      }
+    });
   }
 
   async clearModelAccessCache(): Promise<void> {
@@ -230,15 +338,20 @@ export class CmsisDevLanguageModelProvider
     token: vscode.CancellationToken
   ): Promise<void> {
     const baseUrl = getConfiguredLanguageModelProviderBaseUrl();
+    const diagnosticsLevel = getConfiguredRequestDiagnosticsLevel();
+    const diagnosticsContext = diagnosticsLevel === "off"
+      ? undefined
+      : { requestId: ++this.requestSequence, startedAt: Date.now(), generation: this.diagnosticsGeneration };
 
     const apiKey = await getLanguageModelProviderApiKey();
     if (!apiKey) {
       throw new Error("CMSIS-Dev language model provider API key is not configured.");
     }
 
+    const input = toOpenAiResponsesInput(messages);
     const payload: Record<string, unknown> = {
       model: model.id,
-      input: toOpenAiResponsesInput(messages)
+      input
     };
     const reasoningEffort = readReasoningEffortFromModelOptions(options.modelOptions) ?? getConfiguredReasoningEffort();
     if (reasoningEffort) {
@@ -252,17 +365,61 @@ export class CmsisDevLanguageModelProvider
       payload.tools = tools;
       payload.tool_choice = options.toolMode === vscode.LanguageModelChatToolMode.Required ? "required" : "auto";
     }
+    const responseUrl = joinUrl(baseUrl, "responses");
 
-    const response = await fetchJson<OpenAiResponsesResponse>(joinUrl(baseUrl, "responses"), {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(payload)
-    }, token);
+    try {
+      const response = await fetchJson<OpenAiResponsesResponse>(responseUrl, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload)
+      }, token);
 
-    reportResponsesOutput(response, progress);
+      if (diagnosticsContext) {
+        await this.recordRequestDiagnostics(
+          diagnosticsContext.generation,
+          diagnosticsLevel,
+          input,
+          options.modelOptions,
+          () => buildRequestDiagnosticsMetadata(
+            diagnosticsContext,
+            model.id,
+            reasoningEffort,
+            "completed",
+            buildInputBreakdown(payload, input, tools),
+            response.usage
+          ),
+          () => ({
+            request: buildFullRequestDiagnostics(messages, options, responseUrl, payload),
+            result: { response }
+          })
+        );
+      }
+      reportResponsesOutput(response, progress);
+    } catch (error) {
+      if (diagnosticsContext) {
+        await this.recordRequestDiagnostics(
+          diagnosticsContext.generation,
+          diagnosticsLevel,
+          input,
+          options.modelOptions,
+          () => buildRequestDiagnosticsMetadata(
+            diagnosticsContext,
+            model.id,
+            reasoningEffort,
+            token.isCancellationRequested ? "canceled" : "failed",
+            buildInputBreakdown(payload, input, tools)
+          ),
+          () => ({
+            request: buildFullRequestDiagnostics(messages, options, responseUrl, payload),
+            result: { error: describeDiagnosticError(error) }
+          })
+        );
+      }
+      throw error;
+    }
   }
 
   async provideTokenCount(
@@ -363,12 +520,137 @@ export class CmsisDevLanguageModelProvider
       })
     });
   }
+
+  private async recordRequestDiagnostics(
+    generation: number,
+    level: RequestDiagnosticsLevel,
+    input: readonly { type?: unknown; role?: unknown; content?: unknown }[],
+    modelOptions: Record<string, unknown> | undefined,
+    createMetadata: () => Record<string, unknown>,
+    createFullDetails: () => Record<string, unknown>
+  ): Promise<void> {
+    if (generation !== this.diagnosticsGeneration) {
+      return;
+    }
+    const diagnostics = collectRequestDiagnostics(level, createMetadata, createFullDetails);
+    if (!diagnostics) {
+      return;
+    }
+
+    let diagnosticsFile: string | undefined;
+    if (diagnostics.fullDetails) {
+      try {
+        const file = await this.persistFullRequestDiagnostics({
+          schemaVersion: 1,
+          ...diagnostics.metadata,
+          ...diagnostics.fullDetails
+        });
+        diagnosticsFile = file.fsPath;
+        if (generation !== this.diagnosticsGeneration) {
+          try {
+            await vscode.workspace.fs.delete(file, { useTrash: false });
+          } catch {
+            // Clear may already have removed the diagnostics directory.
+          }
+          return;
+        }
+      } catch (error) {
+        this.usageOutput.warn(`Failed to store full request diagnostics: ${describeProviderError(error)}`);
+      }
+    }
+
+    this.usageOutput.info(JSON.stringify({
+      ...diagnostics.metadata,
+      diagnosticsLevel: level,
+      ...(diagnosticsFile ? { diagnosticsFile } : {})
+    }));
+    this.chatDiagnostics.addRequest(input, diagnostics.metadata, level, diagnosticsFile, { modelOptions });
+    await this.persistChatDiagnosticsIndex();
+    try {
+      await this.trimStoredRequestDiagnostics();
+    } catch (error) {
+      if (!isFileNotFoundError(error)) {
+        this.usageOutput.warn(`Failed to trim request diagnostics: ${describeProviderError(error)}`);
+      }
+    } finally {
+      if (diagnosticsFile) {
+        this.pendingDiagnosticsFiles.delete(diagnosticsFile);
+        if (!this.chatDiagnosticsDirectoryUri) {
+          await this.trimStoredRequestDiagnostics().catch((error) => {
+            if (!isFileNotFoundError(error)) {
+              this.usageOutput.warn(`Failed to trim request diagnostics: ${describeProviderError(error)}`);
+            }
+          });
+        }
+      }
+    }
+  }
+
+  private async persistChatDiagnosticsIndex(): Promise<void> {
+    if (!this.chatDiagnosticsDirectoryUri || !this.chatDiagnosticsIndexUri) {
+      return;
+    }
+    await this.enqueueChatDiagnosticsWrite(async () => {
+      try {
+        await vscode.workspace.fs.createDirectory(this.chatDiagnosticsDirectoryUri!);
+        const temporaryUri = vscode.Uri.joinPath(this.chatDiagnosticsDirectoryUri!, `${CHAT_DIAGNOSTICS_INDEX}.tmp`);
+        const content = new TextEncoder().encode(`${stringifyDiagnostics(this.chatDiagnostics.createSnapshot())}\n`);
+        await vscode.workspace.fs.writeFile(temporaryUri, content);
+        await vscode.workspace.fs.rename(temporaryUri, this.chatDiagnosticsIndexUri!, { overwrite: true });
+      } catch (error) {
+        this.usageOutput.warn(`Failed to persist chat diagnostics index: ${describeProviderError(error)}`);
+      }
+    });
+  }
+
+  private async enqueueChatDiagnosticsWrite(operation: () => Promise<void>): Promise<void> {
+    const pending = this.chatDiagnosticsWrite.then(operation, operation);
+    this.chatDiagnosticsWrite = pending.catch(() => undefined);
+    await pending;
+  }
+
+  private async persistFullRequestDiagnostics(record: Record<string, unknown>): Promise<vscode.Uri> {
+    await vscode.workspace.fs.createDirectory(this.requestDiagnosticsUri);
+    const timestamp = String(record.startedAt ?? new Date().toISOString()).replace(/[:.]/g, "-");
+    const requestId = String(record.requestId ?? this.requestSequence).padStart(6, "0");
+    const file = vscode.Uri.joinPath(this.requestDiagnosticsUri, `${timestamp}-request-${requestId}.json`);
+    this.pendingDiagnosticsFiles.add(file.fsPath);
+    try {
+      await vscode.workspace.fs.writeFile(file, new TextEncoder().encode(`${stringifyDiagnostics(record)}\n`));
+    } catch (error) {
+      this.pendingDiagnosticsFiles.delete(file.fsPath);
+      throw error;
+    }
+    return file;
+  }
+
+  private async trimStoredRequestDiagnostics(): Promise<void> {
+    const entries = await vscode.workspace.fs.readDirectory(this.requestDiagnosticsUri);
+    const files = entries
+      .filter(([name, type]) => type === vscode.FileType.File && name.endsWith(".json"))
+      .map(([name]) => name);
+    const retained = new Set(this.chatDiagnostics.getConversations()
+      .flatMap((conversation) => conversation.requests.map((request) => request.fullDiagnosticsPath))
+      .filter((path): path is string => Boolean(path))
+      .map((path) => vscode.Uri.file(path).fsPath));
+    for (const path of this.pendingDiagnosticsFiles) {
+      retained.add(path);
+    }
+    const retainedFiles = this.chatDiagnosticsDirectoryUri
+      ? new Set(files.filter((name) => retained.has(vscode.Uri.joinPath(this.requestDiagnosticsUri, name).fsPath)))
+      : undefined;
+    const eligibleFiles = retainedFiles
+      ? files
+      : files.filter((name) => !this.pendingDiagnosticsFiles.has(vscode.Uri.joinPath(this.requestDiagnosticsUri, name).fsPath));
+    const excess = selectStoredRequestDiagnosticsToDelete(eligibleFiles, getConfiguredMaxDiagnosticsRequests(), retainedFiles);
+    await Promise.all(excess.map((name) => vscode.workspace.fs.delete(vscode.Uri.joinPath(this.requestDiagnosticsUri, name))));
+  }
 }
 
 export function registerCmsisDevLanguageModelProvider(
   context: vscode.ExtensionContext
 ): CmsisDevLanguageModelProvider {
-  const provider = new CmsisDevLanguageModelProvider(context.globalState);
+  const provider = new CmsisDevLanguageModelProvider(context);
   context.subscriptions.push(
     provider,
     vscode.lm.registerLanguageModelChatProvider(CMSIS_DEV_LANGUAGE_MODEL_VENDOR, provider)
@@ -513,6 +795,52 @@ function getConfiguredDefaultMaxOutputTokens(): number {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : DEFAULT_MAX_OUTPUT_TOKENS;
 }
 
+function getConfiguredRequestDiagnosticsLevel(): RequestDiagnosticsLevel {
+  const value = vscode.workspace
+    .getConfiguration("cmsisDev")
+    .get<RequestDiagnosticsLevel>("languageModelProvider.requestDiagnostics", "metadata");
+  return value === "off" || value === "full" ? value : "metadata";
+}
+
+function getConfiguredMaxDiagnosticsRequests(): number {
+  return getConfiguredDiagnosticsLimit("maxDiagnosticsRequests", DEFAULT_MAX_DIAGNOSTICS_REQUESTS);
+}
+
+function getConfiguredMaxDiagnosticsSessions(): number {
+  return getConfiguredDiagnosticsLimit("maxDiagnosticsSessions", DEFAULT_MAX_DIAGNOSTICS_SESSIONS);
+}
+
+function getConfiguredDiagnosticsLimit(setting: string, fallback: number): number {
+  const value = vscode.workspace.getConfiguration("cmsisDev.languageModelProvider").get<number>(setting, fallback);
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+function buildRequestDiagnosticsMetadata(
+  context: { requestId: number; startedAt: number },
+  model: string,
+  reasoningEffort: string | undefined,
+  status: "completed" | "canceled" | "failed",
+  inputBreakdown: Record<string, unknown>,
+  usage?: OpenAiResponsesResponse["usage"]
+): Record<string, unknown> {
+  return {
+    timestamp: new Date().toISOString(),
+    requestId: context.requestId,
+    model,
+    reasoningEffort,
+    startedAt: new Date(context.startedAt).toISOString(),
+    durationMs: Date.now() - context.startedAt,
+    status,
+    inputTokens: usage?.input_tokens,
+    outputTokens: usage?.output_tokens,
+    totalTokens: usage?.total_tokens,
+    cachedTokens: usage?.input_tokens_details?.cached_tokens,
+    reasoningTokens: usage?.output_tokens_details?.reasoning_tokens,
+    authoritative: Boolean(usage),
+    inputBreakdown
+  };
+}
+
 async function configureLanguageModelProviderBaseUrl(): Promise<void> {
   const current = getConfiguredLanguageModelProviderBaseUrl();
   const nextValue = await vscode.window.showInputBox({
@@ -590,6 +918,17 @@ async function fetchJson<T>(url: string, init: RequestInit, token?: vscode.Cance
 
 function joinUrl(baseUrl: string, pathSegment: string): string {
   return `${baseUrl.replace(/\/+$/, "")}/${pathSegment.replace(/^\/+/, "")}`;
+}
+
+function resolveWorkspaceChatDiagnosticsDirectoryUri(): vscode.Uri | undefined {
+  const workspaceFolder = vscode.workspace.workspaceFolders?.find((folder) => folder.uri.scheme === "file");
+  return workspaceFolder
+    ? vscode.Uri.joinPath(workspaceFolder.uri, ...CHAT_DIAGNOSTICS_DIRECTORY.split("/"))
+    : undefined;
+}
+
+function isFileNotFoundError(error: unknown): boolean {
+  return error instanceof vscode.FileSystemError && error.code === "FileNotFound";
 }
 
 function toLanguageModelInformation(model: OpenAiModelRecord): CmsisDevLanguageModelInformation | undefined {
@@ -672,12 +1011,7 @@ function toOpenAiResponsesInput(messages: readonly vscode.LanguageModelChatReque
 
 function toOpenAiResponsesTools(
   tools: readonly vscode.LanguageModelChatTool[] | undefined
-): Array<{
-  type: "function";
-  name: string;
-  description: string;
-  parameters: object;
-}> {
+): OpenAiResponsesTool[] {
   return (tools ?? []).map((tool) => ({
     type: "function",
     name: tool.name,
@@ -688,6 +1022,44 @@ function toOpenAiResponsesTools(
       additionalProperties: true
     }
   }));
+}
+
+function buildFullRequestDiagnostics(
+  messages: readonly vscode.LanguageModelChatRequestMessage[],
+  options: vscode.ProvideLanguageModelChatResponseOptions,
+  url: string,
+  payload: Record<string, unknown>
+): Record<string, unknown> {
+  return {
+    incoming: {
+      messages: messages.map((message) => ({
+        role: message.role === vscode.LanguageModelChatMessageRole.Assistant ? "assistant" : "user",
+        name: message.name,
+        content: message.content
+      })),
+      toolMode: options.toolMode === vscode.LanguageModelChatToolMode.Required ? "required" : "auto",
+      tools: options.tools ?? [],
+      modelOptions: options.modelOptions ?? {}
+    },
+    outgoing: {
+      url,
+      payload
+    }
+  };
+}
+
+function describeDiagnosticError(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack
+    };
+  }
+
+  return {
+    value: error
+  };
 }
 
 function reportResponsesOutput(

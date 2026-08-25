@@ -62,7 +62,7 @@ That gives the MVP a simple separation of concerns:
 
 The extension entrypoint is `src/extension.ts`. It wires together four responsibilities:
 
-- View registration: `ActionsProvider`, `WorkflowsProvider`, and `RunsProvider`.
+- View registration: `ActionsProvider`, `WorkflowsProvider`, `RunsProvider`, and `ChatDiagnosticsProvider`.
 - Commands: run action, refresh, create overrides, follow-up actions, token management, delete runs.
 - Watchers and diagnostics: workflow file watchers, runs watcher, YAML validation.
 - MCP process hosting: starts `out/mcp/server.js` as a child process and passes the paths it needs via environment variables.
@@ -73,6 +73,7 @@ The UI surface is intentionally thin:
 - The `Actions` view title exposes model controls and shows the effective selection as view description text.
 - `WorkflowsProvider` shows the effective workflow files, labeled as `installed` or `workspace`.
 - `RunsProvider` shows generated outputs from the runs directory and supports multi-select deletion.
+- `ChatDiagnosticsProvider` shows retained proxy requests by chat session; `chatDiagnosticsTrace` derives timing, token usage, and payload composition for the trace webview.
 
 This keeps the views declarative. They render the current model but do not own workflow semantics.
 
@@ -130,6 +131,8 @@ Current execution logic:
 - `src/aiSettings.ts` resolves either an explicitly selected VS Code model or the preferred automatic fallback.
 
 This keeps model execution separate from workflow definition. A workflow does not know which concrete provider or model has been selected for the run.
+
+The proxy provider also records bounded diagnostics according to `cmsisDev.languageModelProvider.requestDiagnostics`. Metadata mode retains timing, reported usage, and outgoing payload sizes; full mode additionally retains request/response JSON. The first local workspace folder holds the session index and full records in `.cmsis-dev/chat-diagnostics/`. The trace distinguishes internal requests from chat requests, peak input from cumulative usage, and missing usage from reported zero. Cached and reasoning counts are subsets of input and output respectively, not additional billable totals.
 
 ## Workflow Registry
 

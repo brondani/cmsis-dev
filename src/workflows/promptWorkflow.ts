@@ -31,6 +31,7 @@ import { IssueSummary, PullRequestFile, PullRequestSummary, WorkflowDefinition, 
 import { BranchCandidate, collectLocalChangesValues, hasTrackedWorkingTreeChanges, runGitCommand, tryRunGitCommand } from "../localGitCore";
 import { buildWorkflowPrompt, normalizeWorkflowFollowUps, resolveWorkflowFollowUps } from "../workflowCore";
 import { resolveWorkflowRunsDirUri } from "../workflowConfig";
+import { beginRunWrite, finishRunWrite, pruneSavedRuns } from "../runRetention";
 import {
   buildIssueContextValues,
   buildPullRequestContextValues,
@@ -421,61 +422,66 @@ async function executeWorkflowGeneration(
     resolved.issueContext,
     resolved.localChangesContext
   );
-  const reasoningPayload: Record<string, unknown> = {
-    timestamp: new Date().toISOString(),
-    status: "completed",
-    phase: "completed",
-    workflowId: workflow.id,
-    workflowTitle: workflow.title,
-    followUps,
-    pullRequestDraft,
-    commitDraft,
-    reasoningEffort,
-    engine,
-    agentName: generated.agentName,
-    modelName: generated.modelName,
-    metrics,
-    prompt,
-    inputValues: resolved.values,
-    prContext: resolved.prContext,
-    issueContext: resolved.issueContext,
-    localChangesContext: resolved.localChangesContext,
-    generatedOutput: output,
-    outputFile: outputFile.fsPath
-  };
-  await updateReasoningFile(liveReasoningFile, reasoningPayload);
-  const reasoningFile = await writeReasoningFile(outputFile, reasoningPayload);
-  reasoningPayload.reasoningFile = reasoningFile.fsPath;
-  await updateReasoningFile(liveReasoningFile, reasoningPayload);
-  await updateReasoningFile(reasoningFile, reasoningPayload);
+  try {
+    const reasoningPayload: Record<string, unknown> = {
+      timestamp: new Date().toISOString(),
+      status: "completed",
+      phase: "completed",
+      workflowId: workflow.id,
+      workflowTitle: workflow.title,
+      followUps,
+      pullRequestDraft,
+      commitDraft,
+      reasoningEffort,
+      engine,
+      agentName: generated.agentName,
+      modelName: generated.modelName,
+      metrics,
+      prompt,
+      inputValues: resolved.values,
+      prContext: resolved.prContext,
+      issueContext: resolved.issueContext,
+      localChangesContext: resolved.localChangesContext,
+      generatedOutput: output,
+      outputFile: outputFile.fsPath
+    };
+    await updateReasoningFile(liveReasoningFile, reasoningPayload);
+    const reasoningFile = await writeReasoningFile(outputFile, reasoningPayload);
+    reasoningPayload.reasoningFile = reasoningFile.fsPath;
+    await updateReasoningFile(liveReasoningFile, reasoningPayload);
+    await updateReasoningFile(reasoningFile, reasoningPayload);
 
-  const metadata: ActionOutputMetadata = {
-    workflowId: workflow.id,
-    workflowTitle: workflow.title,
-    followUps,
-    pullRequestDraft,
-    commitDraft,
-    reasoningEffort,
-    engine,
-    agentName: generated.agentName,
-    modelName: generated.modelName,
-    metrics,
-    prompt,
-    inputValues: resolved.values,
-    generatedOutput: output,
-    outputFile: outputFile.fsPath,
-    reasoningFile: reasoningFile.fsPath,
-    prContext: resolved.prContext,
-    issueContext: resolved.issueContext,
-    localChangesContext: resolved.localChangesContext
-  };
+    const metadata: ActionOutputMetadata = {
+      workflowId: workflow.id,
+      workflowTitle: workflow.title,
+      followUps,
+      pullRequestDraft,
+      commitDraft,
+      reasoningEffort,
+      engine,
+      agentName: generated.agentName,
+      modelName: generated.modelName,
+      metrics,
+      prompt,
+      inputValues: resolved.values,
+      generatedOutput: output,
+      outputFile: outputFile.fsPath,
+      reasoningFile: reasoningFile.fsPath,
+      prContext: resolved.prContext,
+      issueContext: resolved.issueContext,
+      localChangesContext: resolved.localChangesContext
+    };
 
-  return {
-    metadata,
-    outputFile,
-    reasoningFile,
-    output
-  };
+    return {
+      metadata,
+      outputFile,
+      reasoningFile,
+      output
+    };
+  } catch (error) {
+    finishRunWrite(outputFile.fsPath);
+    throw error;
+  }
 }
 
 export async function openReasoningForActiveOutput(): Promise<void> {
@@ -1978,7 +1984,13 @@ async function writeOutputFile(
         ? `-${path.basename(localChangesContext.rootPath)}`
         : "";
   const targetFile = path.join(targetDir, `${workflowId}${contextSegment}-${timestamp}.md`);
+  beginRunWrite(targetFile);
+  try {
     await fs.writeFile(targetFile, formattedContent, "utf8");
+  } catch (error) {
+    finishRunWrite(targetFile);
+    throw error;
+  }
   return vscode.Uri.file(targetFile);
 }
 
@@ -2072,7 +2084,12 @@ async function writeOutputMetadata(outputFile: vscode.Uri, metadata: ActionOutpu
   }
 
   const metadataPath = `${outputFile.fsPath}.meta.json`;
-  await fs.writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+  try {
+    await fs.writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+  } finally {
+    finishRunWrite(outputFile.fsPath);
+  }
+  await pruneSavedRuns();
 }
 
 async function readOutputMetadata(outputUri: vscode.Uri): Promise<ActionOutputMetadata | undefined> {
