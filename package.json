@@ -42,6 +42,10 @@
         "title": "CMSIS-Dev: Run AI Action in Chat"
       },
       {
+        "command": "cmsisDev.transcribeAudio",
+        "title": "CMSIS-Dev: Transcribe Audio"
+      },
+      {
         "command": "cmsisDev.commitMessageInChat",
         "title": "CMSIS-Dev: Commit Message",
         "icon": "$(sparkle)"
@@ -367,8 +371,27 @@
           {
             "name": "plan-next-steps",
             "description": "Continue from a previous CMSIS-Dev run in chat."
+          },
+          {
+            "name": "transcribe-audio",
+            "description": "Transcribe workspace audio or video with a diarized transcript and executive summary."
           }
         ]
+      }
+    ],
+    "languageModelTools": [
+      {
+        "name": "cmsisDevTranscribeAudio",
+        "displayName": "Transcribe Audio",
+        "toolReferenceName": "transcribeAudio",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Select a workspace recording and save a diarized transcript with an executive summary.",
+        "modelDescription": "Select a workspace audio or video recording and save a diarized transcript with an executive summary. Prompts for FFmpeg installation when missing.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
       }
     ],
     "languageModelChatProviders": [
@@ -407,7 +430,7 @@
         "cmsisDev.languageModelProvider.baseUrl": {
           "type": "string",
           "default": "https://openai-api-proxy.geo.arm.com/api/providers/openai/v1",
-          "markdownDescription": "OpenAI-compatible `v1` base URL used by the CMSIS-Dev language model provider for `/models` and `/responses`."
+          "markdownDescription": "OpenAI-compatible `v1` base URL used by CMSIS-Dev for `/models`, `/responses`, and audio transcription."
         },
         "cmsisDev.languageModelProvider.defaultMaxInputTokens": {
           "type": "number",

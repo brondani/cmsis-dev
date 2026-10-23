@@ -83,6 +83,7 @@ Supported chat commands include:
 - `@cmsisdev /explain-issue`
 - `@cmsisdev /explain-ci-failure`
 - `@cmsisdev /plan-next-steps`
+- `@cmsisdev /transcribe-audio`
 
 ## Built-in workflows
 
@@ -107,6 +108,14 @@ CMSIS-Dev reads the local diff, repository pull request templates, and the lates
 ### Commit Message
 
 Use **Commit Message** to generate a commit message from local git changes. The result can be reviewed before using **Commit Changes** from the run output actions.
+
+### Transcribe Audio or Video
+
+Use **Transcribe Audio** from the Actions view or Command Palette, `@cmsisdev /transcribe-audio` in Chat, or the **Transcribe Audio** tool in Chat Agent mode to select a workspace recording and save a diarized transcript with an executive summary. The Chat tool asks for confirmation before opening the picker. Audio and video are converted to temporary mono 16 kHz MP3 chunks of up to three minutes, with 10 seconds of overlap to retain boundary context. Temporary media is removed after the workflow completes or is canceled.
+
+FFmpeg and FFprobe are used when transcribing. If either is unavailable, CMSIS-Dev asks before downloading portable copies into its extension storage using npm (Windows, macOS, and Linux); declining cancels the transcription without installing anything. An npm installation is required for the optional download, or you can install both tools on `PATH` yourself. Chunks are transcribed in order so each request can use references gathered from earlier speakers (up to four); matching overlap utterances also helps carry labels across chunks. The progress notification advances only when a chunk is complete. Speaker matching can still be imperfect when the provider does not recognize a reference or there is no matching utterance at a boundary. Transcript sections may be summarized up to three at a time.
+
+The saved run shows the original recording duration, elapsed transcription processing time (including media preparation and cleanup, but not executive-summary generation), and input/output transcription tokens when reported by the provider. Executive-summary model usage is not included.
 
 ### Explain Issue
 

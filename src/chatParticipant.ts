@@ -2,6 +2,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { loadWorkflowDefinitions } from "./workflowConfig";
 import { WorkflowDefinition } from "./types";
+import { runAudioTranscription } from "./workflows/audioTranscription";
 import { populateGitScmInput, runPromptWorkflowInChat } from "./workflows/promptWorkflow";
 
 const CHAT_PARTICIPANT_ID = "cmsis-dev.chat";
@@ -26,6 +27,23 @@ let pendingChatRun: PendingChatRun | undefined;
 
 export function registerCmsisDevChatParticipant(context: vscode.ExtensionContext): vscode.Disposable {
   const participant = vscode.chat.createChatParticipant(CHAT_PARTICIPANT_ID, async (request, _chatContext, response, token) => {
+    if (request.command === "transcribe-audio") {
+      response.progress("Transcribing audio");
+      const outputFile = await runAudioTranscription(context.globalStorageUri.fsPath);
+      if (outputFile) {
+        response.markdown(`Audio transcription saved to **${path.basename(outputFile.fsPath)}**.`);
+        response.reference(outputFile);
+        response.button({
+          command: "cmsisDev.openRunOutputPreview",
+          title: `Open ${path.basename(outputFile.fsPath)}`,
+          arguments: [outputFile.fsPath]
+        });
+      } else {
+        response.markdown("Audio transcription was not saved.");
+      }
+      return;
+    }
+
     const workflow = await resolveWorkflowForChatRequest(request);
     if (!workflow) {
       const freeformPrompt = request.command ? "" : request.prompt.trim();
@@ -173,7 +191,8 @@ function buildHelpMarkdown(): string {
     "- `/explain-issue` to summarize a GitHub issue.",
     "- `/explain-ci-failure` to explain why a GitHub workflow run is failing.",
     "- `/plan-next-steps` to continue from a previous CMSIS-Dev result in chat.",
+    "- `/transcribe-audio` to transcribe a workspace audio or video recording.",
     "",
-    "Anything after the slash command is appended as extra instructions for that workflow."
+    "For prompt workflows, text after the slash command is appended as extra instructions."
   ].join("\n");
 }

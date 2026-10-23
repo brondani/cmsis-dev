@@ -2,6 +2,20 @@ import * as vscode from "vscode";
 import { WorkflowDefinition } from "./types";
 import { loadWorkflowDefinitions } from "./workflowConfig";
 
+class AudioTranscriptionActionItem extends vscode.TreeItem {
+  constructor() {
+    super("Transcribe Audio", vscode.TreeItemCollapsibleState.None);
+    this.description = "Create a diarized transcript and executive summary";
+    this.contextValue = "cmsisDev.audioTranscriptionAction";
+    this.command = {
+      command: "cmsisDev.transcribeAudio",
+      title: "Transcribe Audio"
+    };
+  }
+}
+
+type ActionTreeItem = ActionItem | AudioTranscriptionActionItem;
+
 export class ActionItem extends vscode.TreeItem {
   constructor(public readonly workflow: WorkflowDefinition) {
     super(workflow.title, vscode.TreeItemCollapsibleState.None);
@@ -15,8 +29,8 @@ export class ActionItem extends vscode.TreeItem {
   }
 }
 
-export class ActionsProvider implements vscode.TreeDataProvider<ActionItem> {
-  private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<ActionItem | undefined | null | void>();
+export class ActionsProvider implements vscode.TreeDataProvider<ActionTreeItem> {
+  private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<ActionTreeItem | undefined | null | void>();
   readonly onDidChangeTreeData = this.onDidChangeTreeDataEmitter.event;
 
   private workflows: WorkflowDefinition[] = [];
@@ -26,15 +40,15 @@ export class ActionsProvider implements vscode.TreeDataProvider<ActionItem> {
     this.onDidChangeTreeDataEmitter.fire();
   }
 
-  getTreeItem(element: ActionItem): vscode.TreeItem {
+  getTreeItem(element: ActionTreeItem): vscode.TreeItem {
     return element;
   }
 
-  async getChildren(): Promise<ActionItem[]> {
+  async getChildren(): Promise<ActionTreeItem[]> {
     if (this.workflows.length === 0) {
       this.workflows = await loadWorkflowDefinitions();
     }
-    return this.workflows.map((workflow) => new ActionItem(workflow));
+    return [new AudioTranscriptionActionItem(), ...this.workflows.map((workflow) => new ActionItem(workflow))];
   }
 
   getWorkflows(): WorkflowDefinition[] {

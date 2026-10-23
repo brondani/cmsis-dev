@@ -774,7 +774,7 @@ async function openLanguageModelValidationReport(state: StoredModelAccessState):
   await vscode.window.showTextDocument(document, { preview: false });
 }
 
-function getConfiguredLanguageModelProviderBaseUrl(): string {
+export function getConfiguredLanguageModelProviderBaseUrl(): string {
   const value = vscode.workspace.getConfiguration("cmsisDev").get<string>("languageModelProvider.baseUrl", "").trim();
   return (value.length > 0 ? value : DEFAULT_PROXY_BASE_URL).replace(/\/+$/, "");
 }

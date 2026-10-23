@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { ActionsProvider } from "./actionsProvider";
+import { runAudioTranscription } from "./workflows/audioTranscription";
 import { ChatDiagnosticsProvider } from "./chatDiagnosticsProvider";
 import { clearOpenChatDiagnosticsTraces, openChatDiagnosticsTrace } from "./chatDiagnosticsTracePanel";
 import { openWorkflowInChat, registerCmsisDevChatParticipant } from "./chatParticipant";
@@ -181,6 +182,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     runsTreeView,
     chatDiagnosticsTreeView,
     registerCmsisDevChatParticipant(context),
+    vscode.lm.registerTool("cmsisDevTranscribeAudio", {
+      prepareInvocation: () => ({
+        invocationMessage: "Transcribing workspace audio or video",
+        confirmationMessages: {
+          title: "Transcribe Audio",
+          message: "Select a workspace recording to transcribe and save with an executive summary?"
+        }
+      }),
+      invoke: async () => {
+        const output = await runAudioTranscription(context.globalStorageUri.fsPath);
+        return new vscode.LanguageModelToolResult([
+          new vscode.LanguageModelTextPart(output
+            ? `Audio transcription saved to ${output.fsPath}`
+            : "No audio transcription was saved.")
+        ]);
+      }
+    }),
     vscode.commands.registerCommand("cmsisDev.initializeWorkflows", async () => {
       await initializeWorkflowConfig();
       await provider.refresh();
@@ -193,6 +211,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
       await openWorkflowInChat(chosen);
+    }),
+    vscode.commands.registerCommand("cmsisDev.transcribeAudio", async () => {
+      await runAudioTranscription(context.globalStorageUri.fsPath);
     }),
     vscode.commands.registerCommand("cmsisDev.commitMessageInChat", async () => {
       const workflow = await resolveWorkflowById("commit-message");
